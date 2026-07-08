@@ -1,0 +1,396 @@
+"""Local ffmpeg-based relay backend."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+from .types import PathStatus
+
+_LOGGER = logging.getLogger(__name__)
+
+FFMPEG_BIN = "ffmpeg"
+CAPTURE_TIMEOUT = 15
+PROCESS_STOP_TIMEOUT = 10
+WATCHDOG_INTERVAL = 30
+
+IntendedMode = Literal["pseudo", "relay"]
+StatusListener = Callable[[str, PathStatus], None]
+
+
+@dataclass
+class _PathState:
+    path: str
+    relay_process: asyncio.subprocess.Process | None = None
+    pseudo_process: asyncio.subprocess.Process | None = None
+    frame_path: str | None = None
+    intended_mode: IntendedMode = "pseudo"
+    last_hls_url: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class LocalFfmpegBackend:
+    """Manage ffmpeg publishers for MediaMTX paths."""
+
+    def __init__(
+        self,
+        mediamtx_host: str,
+        mediamtx_rtsp_port: int,
+        frame_dir: str,
+        default_frame: str | None = None,
+    ) -> None:
+        self._host = mediamtx_host
+        self._port = mediamtx_rtsp_port
+        self._frame_dir = Path(frame_dir)
+        self._default_frame = default_frame or str(self._frame_dir / "default.jpg")
+        self._paths: dict[str, _PathState] = {}
+        self._listeners: list[StatusListener] = []
+        self._watchdog_task: asyncio.Task | None = None
+
+    def add_status_listener(self, listener: StatusListener) -> None:
+        """Register a callback for path status changes."""
+        self._listeners.append(listener)
+
+    def start_watchdog(self) -> None:
+        """Start periodic process health checks."""
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def stop_watchdog(self) -> None:
+        """Stop periodic process health checks."""
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
+
+    async def sync_paths(self, paths: list[str]) -> None:
+        """Register configured paths and stop any removed paths."""
+        path_set = set(paths)
+        for path in paths:
+            self.register_path(path)
+
+        for path, state in list(self._paths.items()):
+            if path in path_set:
+                continue
+            async with state.lock:
+                await self._stop_process(state.relay_process)
+                await self._stop_process(state.pseudo_process)
+                state.relay_process = None
+                state.pseudo_process = None
+            del self._paths[path]
+
+        for path in paths:
+            status = await self.get_status(path)
+            if not status.relay_active and not status.pseudo_active:
+                await self.start_pseudo(path, self._best_image(path))
+
+    def register_path(self, path: str) -> None:
+        """Register a MediaMTX path for management."""
+        if path not in self._paths:
+            self._paths[path] = _PathState(path=path)
+
+    def _notify(self, path: str) -> None:
+        status = self._status(self._paths[path])
+        for listener in self._listeners:
+            listener(path, status)
+
+    def _rtsp_url(self, path: str) -> str:
+        return f"rtsp://{self._host}:{self._port}/{path}"
+
+    def _frame_path(self, path: str) -> Path:
+        return self._frame_dir / f"{path}.jpg"
+
+    def _best_image(self, path: str) -> str:
+        frame = self._frame_path(path)
+        if frame.is_file():
+            return str(frame)
+        if Path(self._default_frame).is_file():
+            return self._default_frame
+        return str(frame)
+
+    async def ensure_frame_dir(self) -> None:
+        """Create the frame storage directory."""
+        await asyncio.to_thread(self._frame_dir.mkdir, parents=True, exist_ok=True)
+
+    async def bootstrap_pseudo_streams(self, paths: list[str]) -> None:
+        """Start pseudo publishers for all configured paths."""
+        await self.ensure_frame_dir()
+        for path in paths:
+            self.register_path(path)
+            image = self._best_image(path)
+            await self.start_pseudo(path, image)
+
+    async def start_pseudo(self, path: str, image_path: str) -> None:
+        """Publish a looping still image to the MediaMTX path."""
+        state = self._paths[path]
+        async with state.lock:
+            await self._stop_process(state.pseudo_process)
+            await self._stop_process(state.relay_process)
+            state.relay_process = None
+
+            if not Path(image_path).is_file():
+                _LOGGER.warning(
+                    "Pseudo image missing for %s (%s); relay may fail until a frame exists",
+                    path,
+                    image_path,
+                )
+                return
+
+            cmd = [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-loop",
+                "1",
+                "-i",
+                image_path,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-tune",
+                "stillimage",
+                "-f",
+                "rtsp",
+                self._rtsp_url(path),
+            ]
+            state.pseudo_process = await self._spawn(cmd, f"pseudo:{path}")
+            state.frame_path = image_path
+            state.intended_mode = "pseudo"
+            state.last_hls_url = None
+            _LOGGER.debug("Started pseudo stream for %s using %s", path, image_path)
+        self._notify(path)
+
+    async def start_relay(self, path: str, hls_url: str) -> None:
+        """Publish a live HLS stream to the MediaMTX path."""
+        state = self._paths[path]
+        async with state.lock:
+            await self._stop_process(state.pseudo_process)
+            state.pseudo_process = None
+            await self._stop_process(state.relay_process)
+
+            cmd = [
+                FFMPEG_BIN,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-i",
+                hls_url,
+                "-c",
+                "copy",
+                "-f",
+                "rtsp",
+                self._rtsp_url(path),
+            ]
+            state.relay_process = await self._spawn(cmd, f"relay:{path}")
+            state.intended_mode = "relay"
+            state.last_hls_url = hls_url
+            _LOGGER.info("Started relay for %s", path)
+        self._notify(path)
+
+    async def stop_relay(self, path: str) -> PathStatus:
+        """Stop live relay, capture last frame, and return to pseudo."""
+        state = self._paths[path]
+        async with state.lock:
+            if state.relay_process is None:
+                status = self._status(state)
+            else:
+                captured = await self._capture_last_frame(path)
+                if captured:
+                    state.frame_path = str(captured)
+
+                await self._stop_process(state.relay_process)
+                state.relay_process = None
+
+                image = self._best_image(path)
+                await self._start_pseudo_unlocked(state, image)
+                state.intended_mode = "pseudo"
+                state.last_hls_url = None
+                status = self._status(state)
+        self._notify(path)
+        return status
+
+    async def shutdown(self) -> None:
+        """Stop all ffmpeg processes."""
+        await self.stop_watchdog()
+        for state in self._paths.values():
+            async with state.lock:
+                await self._stop_process(state.relay_process)
+                await self._stop_process(state.pseudo_process)
+                state.relay_process = None
+                state.pseudo_process = None
+                state.intended_mode = "pseudo"
+                state.last_hls_url = None
+
+    async def get_status(self, path: str) -> PathStatus:
+        """Return current status for a path."""
+        state = self._paths[path]
+        async with state.lock:
+            return self._status(state)
+
+    async def _start_pseudo_unlocked(self, state: _PathState, image_path: str) -> None:
+        await self._stop_process(state.pseudo_process)
+        if not Path(image_path).is_file():
+            _LOGGER.warning("Cannot start pseudo for %s; missing %s", state.path, image_path)
+            return
+
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-loop",
+            "1",
+            "-i",
+            image_path,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-tune",
+            "stillimage",
+            "-f",
+            "rtsp",
+            self._rtsp_url(state.path),
+        ]
+        state.pseudo_process = await self._spawn(cmd, f"pseudo:{state.path}")
+        state.frame_path = image_path
+        state.intended_mode = "pseudo"
+
+    async def _watchdog_loop(self) -> None:
+        """Restart ffmpeg publishers that exit unexpectedly."""
+        try:
+            while True:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+                for path, state in list(self._paths.items()):
+                    await self._check_path_health(path, state)
+        except asyncio.CancelledError:
+            raise
+
+    async def _check_path_health(self, path: str, state: _PathState) -> None:
+        async with state.lock:
+            status = self._status(state)
+            if state.intended_mode == "relay":
+                if status.relay_active:
+                    return
+                _LOGGER.warning(
+                    "Relay for %s exited unexpectedly; restoring pseudo stream",
+                    path,
+                )
+                state.relay_process = None
+                image = self._best_image(path)
+                await self._start_pseudo_unlocked(state, image)
+                state.intended_mode = "pseudo"
+                state.last_hls_url = None
+            elif not status.pseudo_active:
+                _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
+                image = self._best_image(path)
+                await self._start_pseudo_unlocked(state, image)
+        self._notify(path)
+
+    async def _capture_last_frame(self, path: str) -> Path | None:
+        """Grab one frame from the live MediaMTX path before stopping relay."""
+        await self.ensure_frame_dir()
+        output = self._frame_path(path)
+        tmp_output = output.with_suffix(".tmp.jpg")
+
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            self._rtsp_url(path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            str(tmp_output),
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            _, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=CAPTURE_TIMEOUT,
+            )
+            if process.returncode != 0:
+                _LOGGER.warning(
+                    "Frame capture failed for %s: %s",
+                    path,
+                    stderr.decode(errors="replace").strip(),
+                )
+                await asyncio.to_thread(tmp_output.unlink, missing_ok=True)
+                return None
+
+            await asyncio.to_thread(tmp_output.replace, output)
+            _LOGGER.info("Captured last frame for %s at %s", path, output)
+            return output
+        except TimeoutError:
+            _LOGGER.warning("Frame capture timed out for %s", path)
+            return None
+
+    async def _spawn(
+        self, cmd: list[str], label: str
+    ) -> asyncio.subprocess.Process:
+        _LOGGER.debug("Starting %s: %s", label, " ".join(cmd))
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        return process
+
+    async def _stop_process(self, process: asyncio.subprocess.Process | None) -> None:
+        if process is None:
+            return
+        if process.returncode is not None:
+            return
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=PROCESS_STOP_TIMEOUT)
+        except TimeoutError:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            await process.wait()
+
+    def _status(self, state: _PathState) -> PathStatus:
+        relay_running = state.relay_process is not None and state.relay_process.returncode is None
+        pseudo_running = (
+            state.pseudo_process is not None and state.pseudo_process.returncode is None
+        )
+        return PathStatus(
+            path=state.path,
+            relay_active=relay_running,
+            pseudo_active=pseudo_running,
+            frame_path=state.frame_path,
+        )

@@ -1,0 +1,64 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "MediaMTX connection",
+        "description": "Configure the MediaMTX server that exposes stable RTSP paths.",
+        "data": {
+          "mediamtx_host": "MediaMTX host",
+          "mediamtx_rtsp_port": "MediaMTX RTSP port",
+          "frame_dir": "Stored frame directory"
+        }
+      },
+      "camera": {
+        "title": "Camera mapping",
+        "description": "Map a Tapo camera entity to a MediaMTX path.",
+        "data": {
+          "path": "MediaMTX path name",
+          "source_entity": "Source camera entity",
+          "wake_delay": "Wake delay"
+        }
+      },
+      "camera_menu": {
+        "title": "Camera setup",
+        "description": "{count} camera(s) configured so far."
+      }
+    },
+    "error": {
+      "invalid_path": "Path name is required.",
+      "path_exists": "That path is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manage cameras",
+        "description": "Add or remove camera mappings.",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "add_camera": {
+        "title": "Add camera",
+        "description": "Map another Tapo camera entity to a MediaMTX path.",
+        "data": {
+          "path": "MediaMTX path name",
+          "source_entity": "Source camera entity",
+          "wake_delay": "Wake delay"
+        }
+      },
+      "remove_camera": {
+        "title": "Remove camera",
+        "description": "Select a camera path to remove.",
+        "data": {
+          "path": "MediaMTX path"
+        }
+      }
+    },
+    "abort": {
+      "no_cameras": "No cameras are configured.",
+      "camera_not_found": "That camera path was not found.",
+      "last_camera": "At least one camera mapping is required."
+    }
+  }
+}

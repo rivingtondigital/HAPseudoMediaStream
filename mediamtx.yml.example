@@ -1,0 +1,16 @@
+# Paths are created automatically when a publisher connects.
+# Add one path name per camera configured in the HA integration.
+
+paths:
+  stairs:
+    source: publisher
+
+  south:
+    source: publisher
+
+  # Example: enable segmented recording while live relay is active
+  # stairs:
+  #   source: publisher
+  #   record: yes
+  #   recordPath: ./recordings/stairs/%Y-%m-%d_%H-%M-%S-%f
+  #   recordSegmentDuration: 15s
