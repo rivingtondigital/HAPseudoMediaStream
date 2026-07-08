@@ -1,0 +1,38 @@
+# MediaMTX for pseudo_camera
+#
+# Start this stack FIRST — it creates the shared "camera-net" network.
+#
+#   docker compose up -d
+#
+# Other stacks (HA, Frigate, Scrypted) join camera-net as an external network.
+# See docker/README.md for snippets.
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    restart: unless-stopped
+    volumes:
+      - ./docker/mediamtx.yml:/mediamtx.yml:ro
+      - mediamtx-recordings:/recordings
+    ports:
+      # Host access for VLC / debugging. Containers on camera-net use hostname "mediamtx".
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # HLS
+      - "8889:8889"   # WebRTC HTTP
+    networks:
+      - camera-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9997/v3/paths/list"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  camera-net:
+    name: camera-net
+    driver: bridge
+
+volumes:
+  mediamtx-recordings:
