@@ -18,16 +18,14 @@ services:
     ports:
       # Host access for VLC / debugging. Containers on camera-net use hostname "mediamtx".
       - "8554:8554"   # RTSP
+      - "1935:1935"   # RTMP (more reliable ffmpeg publish)
       - "8888:8888"   # HLS
       - "8889:8889"   # WebRTC HTTP
     networks:
       - camera-net
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9997/v3/paths/list"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+    # The default image is minimal (no wget/curl) and the API is disabled by
+    # default, so HTTP-based healthchecks always fail. RTSP on :8554 is the
+    # real liveness signal — verify with: nc -zv 127.0.0.1 8554
 
 networks:
   camera-net:

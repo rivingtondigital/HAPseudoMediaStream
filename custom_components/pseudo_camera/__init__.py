@@ -40,6 +40,16 @@ def _cameras_from_entry(entry: ConfigEntry) -> list[CameraConfig]:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Pseudo Camera from a config entry."""
     cameras = _cameras_from_entry(entry)
+    if not cameras:
+        _LOGGER.error("Pseudo Camera entry has no camera mappings")
+        return False
+
+    _LOGGER.info(
+        "Setting up Pseudo Camera for %s path(s) -> %s:%s",
+        len(cameras),
+        entry.data[CONF_MEDIAMTX_HOST],
+        entry.data[CONF_MEDIAMTX_RTSP_PORT],
+    )
 
     relay_manager = RelayManager(
         mediamtx_host=entry.data[CONF_MEDIAMTX_HOST],

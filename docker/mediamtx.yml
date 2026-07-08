@@ -1,17 +1,12 @@
-# MediaMTX paths — one per camera configured in the HA Pseudo Camera integration.
-# Paths accept RTSP publishers (ffmpeg from HA) and serve readers (Frigate, VLC, etc.)
+# MediaMTX config for pseudo_camera.
+#
+# Add one explicit path per camera, or rely on all_others for any path name.
 
 paths:
-  stairs:
+  stairs_over_door:
     source: publisher
 
-  # Add more paths here and in the HA integration:
-  # south:
-  #   source: publisher
-
-  # Optional: record while live relay is publishing
-  # stairs:
-  #   source: publisher
-  #   record: yes
-  #   recordPath: /recordings/stairs/%Y-%m-%d_%H-%M-%S-%f
-  #   recordSegmentDuration: 15s
+  # Allow any additional paths created from the HA integration without
+  # editing this file again.
+  all_others:
+    source: publisher

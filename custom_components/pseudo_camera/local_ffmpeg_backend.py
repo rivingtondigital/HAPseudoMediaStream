@@ -121,9 +121,45 @@ class LocalFfmpegBackend:
         """Create the frame storage directory."""
         await asyncio.to_thread(self._frame_dir.mkdir, parents=True, exist_ok=True)
 
+    async def ensure_default_frame(self) -> None:
+        """Create a fallback frame if none exists yet."""
+        await self.ensure_frame_dir()
+        default = Path(self._default_frame)
+        if default.is_file() and default.stat().st_size > 0:
+            return
+
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=1280x720",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            str(default),
+        ]
+        _LOGGER.info("Creating default pseudo frame at %s", default)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            _LOGGER.error(
+                "Failed to create default frame %s: %s",
+                default,
+                stderr.decode(errors="replace").strip(),
+            )
+
     async def bootstrap_pseudo_streams(self, paths: list[str]) -> None:
         """Start pseudo publishers for all configured paths."""
-        await self.ensure_frame_dir()
+        await self.ensure_default_frame()
         for path in paths:
             self.register_path(path)
             image = self._best_image(path)
@@ -145,31 +181,13 @@ class LocalFfmpegBackend:
                 )
                 return
 
-            cmd = [
-                FFMPEG_BIN,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-re",
-                "-loop",
-                "1",
-                "-i",
-                image_path,
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-tune",
-                "stillimage",
-                "-f",
-                "rtsp",
-                self._rtsp_url(path),
-            ]
+            cmd = self._pseudo_command(path, image_path)
             state.pseudo_process = await self._spawn(cmd, f"pseudo:{path}")
+            await self._verify_process(state.pseudo_process, f"pseudo:{path}")
             state.frame_path = image_path
             state.intended_mode = "pseudo"
             state.last_hls_url = None
-            _LOGGER.debug("Started pseudo stream for %s using %s", path, image_path)
+            _LOGGER.info("Started pseudo stream for %s using %s", path, image_path)
         self._notify(path)
 
     async def start_relay(self, path: str, hls_url: str) -> None:
@@ -192,9 +210,12 @@ class LocalFfmpegBackend:
                 "copy",
                 "-f",
                 "rtsp",
+                "-rtsp_transport",
+                "tcp",
                 self._rtsp_url(path),
             ]
             state.relay_process = await self._spawn(cmd, f"relay:{path}")
+            await self._verify_process(state.relay_process, f"relay:{path}")
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
             _LOGGER.info("Started relay for %s", path)
@@ -246,27 +267,9 @@ class LocalFfmpegBackend:
             _LOGGER.warning("Cannot start pseudo for %s; missing %s", state.path, image_path)
             return
 
-        cmd = [
-            FFMPEG_BIN,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-re",
-            "-loop",
-            "1",
-            "-i",
-            image_path,
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-tune",
-            "stillimage",
-            "-f",
-            "rtsp",
-            self._rtsp_url(state.path),
-        ]
+        cmd = self._pseudo_command(state.path, image_path)
         state.pseudo_process = await self._spawn(cmd, f"pseudo:{state.path}")
+        await self._verify_process(state.pseudo_process, f"pseudo:{state.path}")
         state.frame_path = image_path
         state.intended_mode = "pseudo"
 
@@ -351,17 +354,80 @@ class LocalFfmpegBackend:
             _LOGGER.warning("Frame capture timed out for %s", path)
             return None
 
+    def _pseudo_command(self, path: str, image_path: str) -> list[str]:
+        return [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-loop",
+            "1",
+            "-i",
+            image_path,
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "600k",
+            "-g",
+            "25",
+            "-max_muxing_queue_size",
+            "1024",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            self._rtsp_url(path),
+        ]
+
     async def _spawn(
         self, cmd: list[str], label: str
     ) -> asyncio.subprocess.Process:
-        _LOGGER.debug("Starting %s: %s", label, " ".join(cmd))
+        _LOGGER.info("Starting %s: %s", label, " ".join(cmd))
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        asyncio.create_task(self._monitor_process(process, label))
         return process
+
+    async def _verify_process(
+        self, process: asyncio.subprocess.Process, label: str
+    ) -> None:
+        await asyncio.sleep(0.5)
+        if process.returncode is not None:
+            stderr = b""
+            if process.stderr is not None:
+                stderr = await process.stderr.read()
+            _LOGGER.error(
+                "%s exited immediately (code %s): %s",
+                label,
+                process.returncode,
+                stderr.decode(errors="replace").strip(),
+            )
+
+    async def _monitor_process(
+        self, process: asyncio.subprocess.Process, label: str
+    ) -> None:
+        if process.stderr is None:
+            await process.wait()
+            return
+        stderr = await process.stderr.read()
+        returncode = await process.wait()
+        if returncode != 0:
+            _LOGGER.error(
+                "%s exited (code %s): %s",
+                label,
+                returncode,
+                stderr.decode(errors="replace").strip(),
+            )
 
     async def _stop_process(self, process: asyncio.subprocess.Process | None) -> None:
         if process is None:
