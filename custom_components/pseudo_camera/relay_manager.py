@@ -62,13 +62,11 @@ class RelayManager:
         """Restart pseudo publishers for all configured paths."""
         await self._backend.bootstrap_pseudo_streams(list(self._cameras))
 
-    async def start_relay(
-        self, path: str, hls_url: str, access_token: str | None = None
-    ) -> None:
+    async def start_relay(self, path: str, hls_url: str) -> None:
         """Start live relay for a path."""
         if path not in self._cameras:
             raise ValueError(f"Unknown path: {path}")
-        await self._backend.start_relay(path, hls_url, access_token)
+        await self._backend.start_relay(path, hls_url)
 
     async def stop_relay(self, path: str) -> PathStatus:
         """Stop live relay and restore pseudo stream."""

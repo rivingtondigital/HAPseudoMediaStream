@@ -188,9 +188,7 @@ class LocalFfmpegBackend:
             _LOGGER.info("Started pseudo stream for %s using %s", path, source)
         self._notify(path)
 
-    async def start_relay(
-        self, path: str, hls_url: str, access_token: str | None = None
-    ) -> None:
+    async def start_relay(self, path: str, hls_url: str) -> None:
         """Publish a live HLS stream to the MediaMTX path."""
         state = self._paths[path]
         async with state.lock:
@@ -201,7 +199,7 @@ class LocalFfmpegBackend:
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                *ffmpeg_stream_input_args(hls_url, access_token),
+                *ffmpeg_stream_input_args(hls_url),
                 "-re",
                 "-i",
                 hls_url,

@@ -16,7 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .frame_utils import MIN_FRAME_BYTES, async_is_valid_jpeg, async_remove_invalid_frame
 from .local_ffmpeg_backend import FFMPEG_BIN
-from .stream_utils import ffmpeg_stream_input_args, ha_stream_needs_auth
+from .stream_utils import ffmpeg_stream_input_args, prepare_ha_stream_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -163,18 +163,14 @@ async def _capture_via_stream(
         _LOGGER.warning("No stream source for %s", source_entity)
         return False
 
+    stream_source = prepare_ha_stream_url(hass, stream_source)
     tmp_output = output_path.with_suffix(".tmp.jpg")
     cmd = [
         FFMPEG_BIN,
         "-hide_banner",
         "-loglevel",
         "error",
-        *ffmpeg_stream_input_args(
-            stream_source,
-            hass.auth.async_create_access_token(expire_hours=1)
-            if ha_stream_needs_auth(stream_source)
-            else None,
-        ),
+        *ffmpeg_stream_input_args(stream_source),
         "-i",
         stream_source,
         "-frames:v",

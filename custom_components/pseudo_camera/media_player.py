@@ -22,7 +22,7 @@ from .const import (
 )
 from .device import camera_device_info
 from .relay_manager import RelayManager
-from .stream_utils import ha_stream_needs_auth
+from .stream_utils import prepare_ha_stream_url
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -112,13 +112,9 @@ class PseudoCameraMediaPlayer(MediaPlayerEntity):
             media_type,
             media_id,
         )
-        access_token = None
-        if ha_stream_needs_auth(media_id):
-            access_token = self.hass.auth.async_create_access_token(expire_hours=1)
+        stream_url = prepare_ha_stream_url(self.hass, media_id)
         try:
-            await self._relay_manager.start_relay(
-                self.path, media_id, access_token=access_token
-            )
+            await self._relay_manager.start_relay(self.path, stream_url)
         except Exception:
             _LOGGER.exception("Failed to start relay for %s", self.path)
             raise
