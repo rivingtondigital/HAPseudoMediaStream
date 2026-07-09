@@ -26,6 +26,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./docker/mediamtx.yml:/mediamtx.yml:ro
+      - ./docker/offline:/offline:ro
       - mediamtx-recordings:/recordings
       - ./logs:/logs
     ports:

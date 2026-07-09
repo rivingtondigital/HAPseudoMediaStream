@@ -6,6 +6,7 @@
 #
 # alwaysAvailable is only valid on concrete path names — never pathDefaults,
 # all, all_others, or regex paths.
+# alwaysAvailableFile and alwaysAvailableTracks are mutually exclusive.
 
 logLevel: info
 logDestinations: [stdout, file]
@@ -36,5 +37,5 @@ pathDefaults:
 paths:
   stairs_over_door:
     alwaysAvailable: true
-    alwaysAvailableTracks:
-      - codec: H264
+    # Matches HA pseudo/relay profile (1280x720 H264 baseline, no audio).
+    alwaysAvailableFile: /offline/gray_720p.mp4

@@ -214,14 +214,13 @@ class LocalFfmpegBackend:
 
         Make-before-break: start relay while the current publisher is still up;
         MediaMTX overridePublisher displaces it so Frigate keeps one session.
+        Previous publishers stay attached until the new relay is verified so a
+        failed HLS open does not leave the path empty.
         """
         state = self._paths[path]
         async with state.lock:
             previous_relay = state.relay_process
             previous_pseudo = state.pseudo_process
-            # Detach so displaced-process monitors do not restart them.
-            state.relay_process = None
-            state.pseudo_process = None
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
 
@@ -243,14 +242,20 @@ class LocalFfmpegBackend:
                 "flv",
                 self._rtmp_publish_url(path),
             ]
-            state.relay_process = await self._spawn(cmd, f"relay:{path}")
-            if not await self._verify_process(state.relay_process, f"relay:{path}"):
-                await self._stop_relay(state)
-                await self._stop_process(previous_pseudo)
-                await self._stop_process(previous_relay)
-                await self._restore_pseudo(state, None)
+            new_relay = await self._spawn(cmd, f"relay:{path}")
+            if not await self._verify_process(new_relay, f"relay:{path}"):
+                await self._stop_process(new_relay)
+                state.intended_mode = (
+                    "relay" if previous_relay is not None else "pseudo"
+                )
+                if previous_relay is None and previous_pseudo is None:
+                    await self._restore_pseudo(state, None)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
 
+            # Detach old handles only after the new publisher is alive so their
+            # monitors do not restart them during the handoff.
+            state.relay_process = new_relay
+            state.pseudo_process = None
             self._monitor_relay(state)
             await self._stop_process(previous_pseudo)
             await self._stop_process(previous_relay)

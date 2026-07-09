@@ -121,11 +121,7 @@ class PseudoCameraMediaPlayer(MediaPlayerEntity):
 
     async def async_media_stop(self) -> None:
         """Stop relay and restore pseudo stream."""
-        if not self._relay_active:
-            return
         _LOGGER.info("Stopping relay for %s", self.path)
-        self._relay_active = False
-        self.async_write_ha_state()
         await self._relay_manager.stop_relay(self.path)
 
     @callback
