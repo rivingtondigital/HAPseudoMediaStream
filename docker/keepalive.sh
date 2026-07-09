@@ -1,6 +1,5 @@
 #!/bin/sh
 # Publish gray RTMP fallback when a MediaMTX path has no active publisher.
-# HA pseudo/relay takes priority; this only fills gaps (404s).
 
 set -u
 
@@ -8,6 +7,7 @@ MEDIAMTX_API="${MEDIAMTX_API:-http://mediamtx:9997}"
 RTMP_BASE="${RTMP_BASE:-rtmp://mediamtx:1935}"
 PATHS="${KEEPALIVE_PATHS:-stairs_over_door}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
+LOG_DIR="${LOG_DIR:-/logs}"
 
 path_has_publisher() {
   path="$1"
@@ -41,9 +41,17 @@ watch_path() {
   done
 }
 
-for path in $(echo "$PATHS" | tr ',' ' '); do
-  [ -n "$path" ] || continue
-  watch_path "$path" &
-done
+run() {
+  for path in $(echo "$PATHS" | tr ',' ' '); do
+    [ -n "$path" ] || continue
+    watch_path "$path" &
+  done
+  wait
+}
 
-wait
+mkdir -p "$LOG_DIR"
+if [ -w "$LOG_DIR" ]; then
+  run 2>&1 | tee -a "${LOG_DIR}/keepalive.log"
+else
+  run
+fi

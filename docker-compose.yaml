@@ -1,31 +1,43 @@
 # MediaMTX for pseudo_camera
 #
-# Start this stack FIRST — it creates the shared "camera-net" network.
-#
 #   docker compose up -d --build
 #
-# Other stacks (HA, Frigate, Scrypted) join camera-net as an external network.
-# See docker/README.md for snippets.
+# Logs on host:
+#   ./logs/mediamtx.log      (MediaMTX file log)
+#   ./logs/keepalive.log     (fallback publisher)
+#   docker logs mediamtx     (stdout, always available)
 
 services:
+  logs-init:
+    image: alpine:3.20
+    container_name: mtx-logs-init
+    volumes:
+      - ./logs:/logs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p /logs && touch /logs/mediamtx.log /logs/keepalive.log && chmod -R a+rwX /logs
+    restart: "no"
+
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    image: bluenviron/mediamtx:1.19.2
     container_name: mediamtx
     restart: unless-stopped
+    depends_on:
+      logs-init:
+        condition: service_completed_successfully
     volumes:
       - ./docker/mediamtx.yml:/mediamtx.yml:ro
       - mediamtx-recordings:/recordings
+      - ./logs:/logs
     ports:
-      # Host access for VLC / debugging. Containers on camera-net use hostname "mediamtx".
       - "8554:8554"   # RTSP
-      - "1935:1935"   # RTMP (more reliable ffmpeg publish)
+      - "1935:1935"   # RTMP
       - "8888:8888"   # HLS
       - "8889:8889"   # WebRTC HTTP
+      - "9997:9997"   # API (debugging)
     networks:
       - camera-net
 
-  # Publishes gray fallback when MediaMTX reports no RTMP publisher on a path.
-  # HA pseudo/relay takes over automatically when it connects.
   mtx-keepalive:
     build:
       context: ./docker
@@ -33,12 +45,24 @@ services:
     container_name: mtx-keepalive
     restart: unless-stopped
     depends_on:
-      - mediamtx
+      logs-init:
+        condition: service_completed_successfully
+      mediamtx:
+        condition: service_started
     networks:
       - camera-net
     environment:
       KEEPALIVE_PATHS: stairs_over_door
       MEDIAMTX_API: http://mediamtx:9997
+      LOG_DIR: /logs
+    volumes:
+      - ./logs:/logs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://mediamtx:9997/v3/config/global/get"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   camera-net:

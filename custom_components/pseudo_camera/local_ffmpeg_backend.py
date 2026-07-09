@@ -20,12 +20,10 @@ from .types import PathStatus
 _LOGGER = logging.getLogger(__name__)
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
-FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
-PATH_PROBE_TIMEOUT = 5
 CAPTURE_TIMEOUT = 15
 LAST_FRAME_CAPTURE_TIMEOUT = 5
 PROCESS_STOP_TIMEOUT = 10
-WATCHDOG_INTERVAL = 5
+WATCHDOG_INTERVAL = 30
 PUBLISH_SETTLE_DELAY = 0.5
 PUBLISHER_VERIFY_DELAY = 0.75
 HANDOFF_GAP = 0.25
@@ -332,34 +330,6 @@ class LocalFfmpegBackend:
         except asyncio.CancelledError:
             raise
 
-    async def _async_path_is_readable(self, path: str) -> bool:
-        """Return True when MediaMTX is serving RTSP for the path."""
-        cmd = [
-            FFPROBE_BIN,
-            "-v",
-            "error",
-            "-rtsp_transport",
-            "tcp",
-            "-show_entries",
-            "stream=codec_type",
-            "-of",
-            "csv=p=0",
-            self._rtsp_read_url(path),
-        ]
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(
-                process.communicate(),
-                timeout=PATH_PROBE_TIMEOUT,
-            )
-        except TimeoutError:
-            return False
-        return process.returncode == 0 and b"video" in stdout
-
     async def _check_path_health(self, path: str, state: _PathState) -> None:
         async with state.lock:
             status = self._status(state)
@@ -373,16 +343,7 @@ class LocalFfmpegBackend:
                 await self._stop_relay(state)
                 await asyncio.sleep(HANDOFF_GAP)
                 await self._restore_pseudo(state, None)
-            elif status.pseudo_active:
-                if await self._async_path_is_readable(path):
-                    return
-                _LOGGER.warning(
-                    "Pseudo ffmpeg for %s is running but RTSP path is down; restarting",
-                    path,
-                )
-                await self._stop_pseudo(state)
-                await self._restore_pseudo(state, None)
-            else:
+            elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
                 await self._restore_pseudo(state, None)
         self._notify(path)

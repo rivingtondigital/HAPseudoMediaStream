@@ -1,19 +1,21 @@
 # MediaMTX config for pseudo_camera.
 #
-# Add one explicit path per camera, or rely on all_others for any path name.
+# Gray fallback publishing is handled by the mtx-keepalive sidecar.
+# Logs go to stdout (docker logs) and optionally ./logs/mediamtx.log via bind mount.
 
-# Control API for mtx-keepalive (listens on all interfaces inside the container).
+logLevel: info
+logDestinations: [stdout, file]
+logFile: /logs/mediamtx.log
+
 api: yes
 apiAddress: :9997
+
+pathDefaults:
+  overridePublisher: true
 
 paths:
   stairs_over_door:
     source: publisher
-    # Smooth micro-glitches for readers; does not help when no publisher at all.
-    readBufferCount: 512
 
-  # Allow any additional paths created from the HA integration without
-  # editing this file again.
   all_others:
     source: publisher
-    readBufferCount: 512
