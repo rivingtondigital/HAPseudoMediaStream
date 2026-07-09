@@ -211,6 +211,8 @@ class LocalFfmpegBackend:
                 "-loglevel",
                 "error",
                 *ffmpeg_stream_input_args(hls_url),
+                "-fflags",
+                "+genpts",
                 "-re",
                 "-i",
                 hls_url,
@@ -401,10 +403,26 @@ class LocalFfmpegBackend:
             _LOGGER.warning("Frame capture timed out for %s", path)
             return None
 
-    def _output_scale_filter(self) -> str:
-        return (
+    def _output_scale_filter(self, *, with_fps: bool = True) -> str:
+        scale = (
             f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={OUTPUT_FPS}"
+            f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+        )
+        if with_fps:
+            return f"{scale},fps={OUTPUT_FPS}"
+        return scale
+
+    @staticmethod
+    def _escape_lavfi_path(path: str) -> str:
+        return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
+
+    def _pseudo_image_source(self, image_path: str) -> str:
+        """Lavfi movie source with monotonic PTS for static loops."""
+        escaped = self._escape_lavfi_path(image_path)
+        return (
+            f"movie=filename='{escaped}':loop=0,"
+            f"setpts=N/{OUTPUT_FPS}/TB,"
+            f"{self._output_scale_filter()}"
         )
 
     def _output_video_args(self, *, static: bool) -> list[str]:
@@ -423,29 +441,22 @@ class LocalFfmpegBackend:
             "0",
             "-sc_threshold",
             "0",
+            "-r",
+            str(OUTPUT_FPS),
+            "-fps_mode",
+            "cfr",
+            "-g",
+            str(OUTPUT_GOP),
+            "-keyint_min",
+            str(OUTPUT_GOP),
         ]
         if static:
-            args.extend(
-                [
-                    "-b:v",
-                    "600k",
-                    "-g",
-                    "1",
-                    "-keyint_min",
-                    "1",
-                    "-x264-params",
-                    "scenecut=0",
-                ]
-            )
+            args.extend(["-tune", "stillimage", "-b:v", "600k"])
         else:
             args.extend(
                 [
                     "-b:v",
                     "1500k",
-                    "-g",
-                    str(OUTPUT_GOP),
-                    "-keyint_min",
-                    str(OUTPUT_GOP),
                     "-force_key_frames",
                     "expr:gte(t,n_forced*1)",
                 ]
@@ -464,15 +475,17 @@ class LocalFfmpegBackend:
             "-re",
         ]
         if image_path:
-            cmd.extend(["-loop", "1", "-i", image_path])
-            cmd.extend(["-vf", self._output_scale_filter()])
+            cmd.extend(["-f", "lavfi", "-i", self._pseudo_image_source(image_path)])
         else:
             cmd.extend(
                 [
                     "-f",
                     "lavfi",
                     "-i",
-                    f"color=c=gray:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}",
+                    (
+                        f"color=c=gray:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS},"
+                        f"setpts=N/{OUTPUT_FPS}/TB"
+                    ),
                 ]
             )
         cmd.extend(
@@ -572,7 +585,7 @@ class LocalFfmpegBackend:
         async with state.lock:
             if state.intended_mode != kind:
                 return
-            await asyncio.sleep(PUBLISH_SETTLE_DELAY)
+            await asyncio.sleep(HANDOFF_GAP)
             if kind == "pseudo":
                 await self._start_pseudo_unlocked(
                     state, None, settle=False, stop_existing=False
