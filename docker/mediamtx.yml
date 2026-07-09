@@ -10,6 +10,19 @@ logFile: /logs/mediamtx.log
 api: yes
 apiAddress: :9997
 
+# Default auth only allows API from 127.0.0.1 inside the container.
+# Host curl and mtx-keepalive reach the API via Docker networking (172.x),
+# so allow publish/read/api for the local stack without credentials.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
 pathDefaults:
   overridePublisher: true
 

@@ -22,8 +22,13 @@ docker logs mtx-keepalive 2>&1 | tail -10 || echo "(keepalive container missing)
 echo ""
 echo "=== path status (API) ==="
 curl -sf http://127.0.0.1:9997/v3/paths/get/stairs_over_door 2>/dev/null \
-  || docker exec mediamtx wget -qO- http://127.0.0.1:9997/v3/paths/get/stairs_over_door 2>/dev/null \
-  || echo "(API unreachable — is mediamtx running?)"
+  || echo "(API unreachable on :9997 — check mediamtx is Up and port is published)"
+
+echo ""
+echo "=== publisher fight check ==="
+echo "172.19.0.1 = HA (host network)  |  172.19.0.3 = Frigate  |  172.19.0.4 = keepalive"
+echo "If logs show rapid 'closing existing publisher', keepalive and HA are fighting."
+echo "Rebuild keepalive after updating: docker compose up -d --build mtx-keepalive"
 
 echo ""
 echo "=== common failures ==="
