@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ from .types import PathStatus
 
 _LOGGER = logging.getLogger(__name__)
 
-FFMPEG_BIN = "ffmpeg"
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 CAPTURE_TIMEOUT = 15
 PROCESS_STOP_TIMEOUT = 10
 WATCHDOG_INTERVAL = 30
@@ -91,7 +92,7 @@ class LocalFfmpegBackend:
         for path in paths:
             status = await self.get_status(path)
             if not status.relay_active and not status.pseudo_active:
-                await self.start_pseudo(path, self._best_image(path))
+                await self.start_pseudo(path)
 
     def register_path(self, path: str) -> None:
         """Register a MediaMTX path for management."""
@@ -109,13 +110,12 @@ class LocalFfmpegBackend:
     def _frame_path(self, path: str) -> Path:
         return self._frame_dir / f"{path}.jpg"
 
-    def _best_image(self, path: str) -> str:
+    def _captured_frame(self, path: str) -> str | None:
+        """Return a saved last-frame image for a path, if valid."""
         frame = self._frame_path(path)
-        if frame.is_file():
+        if frame.is_file() and frame.stat().st_size > 100:
             return str(frame)
-        if Path(self._default_frame).is_file():
-            return self._default_frame
-        return str(frame)
+        return None
 
     async def ensure_frame_dir(self) -> None:
         """Create the frame storage directory."""
@@ -159,27 +159,27 @@ class LocalFfmpegBackend:
 
     async def bootstrap_pseudo_streams(self, paths: list[str]) -> None:
         """Start pseudo publishers for all configured paths."""
-        await self.ensure_default_frame()
+        _LOGGER.info("Using ffmpeg binary: %s", FFMPEG_BIN)
+        await self.ensure_frame_dir()
         for path in paths:
             self.register_path(path)
-            image = self._best_image(path)
-            await self.start_pseudo(path, image)
+            await self.start_pseudo(path)
+            status = await self.get_status(path)
+            _LOGGER.info(
+                "Path %s bootstrap: pseudo_active=%s relay_active=%s",
+                path,
+                status.pseudo_active,
+                status.relay_active,
+            )
 
-    async def start_pseudo(self, path: str, image_path: str) -> None:
-        """Publish a looping still image to the MediaMTX path."""
+    async def start_pseudo(self, path: str) -> None:
+        """Publish pseudo stream (last captured frame or gray lavfi fallback)."""
         state = self._paths[path]
+        image_path = self._captured_frame(path)
         async with state.lock:
             await self._stop_process(state.pseudo_process)
             await self._stop_process(state.relay_process)
             state.relay_process = None
-
-            if not Path(image_path).is_file():
-                _LOGGER.warning(
-                    "Pseudo image missing for %s (%s); relay may fail until a frame exists",
-                    path,
-                    image_path,
-                )
-                return
 
             cmd = self._pseudo_command(path, image_path)
             state.pseudo_process = await self._spawn(cmd, f"pseudo:{path}")
@@ -187,7 +187,8 @@ class LocalFfmpegBackend:
             state.frame_path = image_path
             state.intended_mode = "pseudo"
             state.last_hls_url = None
-            _LOGGER.info("Started pseudo stream for %s using %s", path, image_path)
+            source = image_path or "lavfi gray"
+            _LOGGER.info("Started pseudo stream for %s using %s", path, source)
         self._notify(path)
 
     async def start_relay(self, path: str, hls_url: str) -> None:
@@ -235,8 +236,7 @@ class LocalFfmpegBackend:
                 await self._stop_process(state.relay_process)
                 state.relay_process = None
 
-                image = self._best_image(path)
-                await self._start_pseudo_unlocked(state, image)
+                await self._start_pseudo_unlocked(state)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
                 status = self._status(state)
@@ -261,11 +261,9 @@ class LocalFfmpegBackend:
         async with state.lock:
             return self._status(state)
 
-    async def _start_pseudo_unlocked(self, state: _PathState, image_path: str) -> None:
+    async def _start_pseudo_unlocked(self, state: _PathState) -> None:
+        image_path = self._captured_frame(state.path)
         await self._stop_process(state.pseudo_process)
-        if not Path(image_path).is_file():
-            _LOGGER.warning("Cannot start pseudo for %s; missing %s", state.path, image_path)
-            return
 
         cmd = self._pseudo_command(state.path, image_path)
         state.pseudo_process = await self._spawn(cmd, f"pseudo:{state.path}")
@@ -294,14 +292,12 @@ class LocalFfmpegBackend:
                     path,
                 )
                 state.relay_process = None
-                image = self._best_image(path)
-                await self._start_pseudo_unlocked(state, image)
+                await self._start_pseudo_unlocked(state)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
             elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
-                image = self._best_image(path)
-                await self._start_pseudo_unlocked(state, image)
+                await self._start_pseudo_unlocked(state)
         self._notify(path)
 
     async def _capture_last_frame(self, path: str) -> Path | None:
@@ -320,6 +316,8 @@ class LocalFfmpegBackend:
             "-i",
             self._rtsp_url(path),
             "-frames:v",
+            "1",
+            "-update",
             "1",
             "-q:v",
             "2",
@@ -354,36 +352,41 @@ class LocalFfmpegBackend:
             _LOGGER.warning("Frame capture timed out for %s", path)
             return None
 
-    def _pseudo_command(self, path: str, image_path: str) -> list[str]:
-        return [
+    def _pseudo_command(self, path: str, image_path: str | None) -> list[str]:
+        cmd = [
             FFMPEG_BIN,
             "-hide_banner",
             "-loglevel",
             "error",
             "-re",
-            "-loop",
-            "1",
-            "-i",
-            image_path,
-            "-an",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "ultrafast",
-            "-b:v",
-            "600k",
-            "-g",
-            "25",
-            "-max_muxing_queue_size",
-            "1024",
-            "-f",
-            "rtsp",
-            "-rtsp_transport",
-            "tcp",
-            self._rtsp_url(path),
         ]
+        if image_path:
+            cmd.extend(["-loop", "1", "-i", image_path])
+        else:
+            cmd.extend(["-f", "lavfi", "-i", "color=c=gray:s=1280x720:r=5"])
+        cmd.extend(
+            [
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "ultrafast",
+                "-b:v",
+                "600k",
+                "-g",
+                "25",
+                "-max_muxing_queue_size",
+                "1024",
+                "-f",
+                "rtsp",
+                "-rtsp_transport",
+                "tcp",
+                self._rtsp_url(path),
+            ]
+        )
+        return cmd
 
     async def _spawn(
         self, cmd: list[str], label: str

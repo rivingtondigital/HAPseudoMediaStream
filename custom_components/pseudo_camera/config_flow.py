@@ -24,6 +24,7 @@ from .const import (
     DEFAULT_WAKE_DELAY,
     DOMAIN,
 )
+from .frame_capture import async_capture_camera_frame, frame_path_for
 from .options_flow import PseudoCameraOptionsFlowHandler
 
 
@@ -37,6 +38,8 @@ class PseudoCameraConfigFlow(ConfigFlow, domain=DOMAIN):
         self._mediamtx_rtsp_port = DEFAULT_MEDIAMTX_RTSP_PORT
         self._frame_dir = DEFAULT_FRAME_DIR
         self._cameras: list[dict[str, Any]] = []
+        self._last_capture_ok = True
+        self._last_capture_path = ""
 
     @staticmethod
     @callback
@@ -86,12 +89,18 @@ class PseudoCameraConfigFlow(ConfigFlow, domain=DOMAIN):
             elif any(camera[CONF_PATH] == path for camera in self._cameras):
                 errors[CONF_PATH] = "path_exists"
             else:
-                self._cameras.append(
-                    {
-                        CONF_PATH: path,
-                        CONF_SOURCE_ENTITY: user_input[CONF_SOURCE_ENTITY],
-                        CONF_WAKE_DELAY: user_input[CONF_WAKE_DELAY],
-                    }
+                camera_config = {
+                    CONF_PATH: path,
+                    CONF_SOURCE_ENTITY: user_input[CONF_SOURCE_ENTITY],
+                    CONF_WAKE_DELAY: int(user_input[CONF_WAKE_DELAY]),
+                }
+                self._cameras.append(camera_config)
+                self._last_capture_path = path
+                self._last_capture_ok = await async_capture_camera_frame(
+                    self.hass,
+                    camera_config[CONF_SOURCE_ENTITY],
+                    frame_path_for(self._frame_dir, path),
+                    camera_config[CONF_WAKE_DELAY],
                 )
                 return await self.async_step_camera_menu()
 
@@ -135,7 +144,15 @@ class PseudoCameraConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="camera_menu",
-            description_placeholders={"count": str(len(self._cameras))},
+            description_placeholders={
+                "count": str(len(self._cameras)),
+                "path": self._last_capture_path,
+                "capture_status": (
+                    "Initial frame captured successfully."
+                    if self._last_capture_ok
+                    else "Initial frame capture failed; a gray fallback will be used until the first live relay ends."
+                ),
+            },
             data_schema=vol.Schema(
                 {
                     vol.Required("action"): selector.SelectSelector(

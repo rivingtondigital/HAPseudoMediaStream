@@ -11,12 +11,13 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_CAMERAS,
+    CONF_FRAME_DIR,
     CONF_PATH,
     CONF_SOURCE_ENTITY,
     CONF_WAKE_DELAY,
     DEFAULT_WAKE_DELAY,
-    DOMAIN,
 )
+from .frame_capture import async_capture_camera_frame, frame_path_for
 
 
 class PseudoCameraOptionsFlowHandler(OptionsFlow):
@@ -72,13 +73,18 @@ class PseudoCameraOptionsFlowHandler(OptionsFlow):
             elif any(camera[CONF_PATH] == path for camera in cameras):
                 errors[CONF_PATH] = "path_exists"
             else:
-                cameras.append(
-                    {
-                        CONF_PATH: path,
-                        CONF_SOURCE_ENTITY: user_input[CONF_SOURCE_ENTITY],
-                        CONF_WAKE_DELAY: user_input[CONF_WAKE_DELAY],
-                    }
+                camera_config = {
+                    CONF_PATH: path,
+                    CONF_SOURCE_ENTITY: user_input[CONF_SOURCE_ENTITY],
+                    CONF_WAKE_DELAY: int(user_input[CONF_WAKE_DELAY]),
+                }
+                await async_capture_camera_frame(
+                    self.hass,
+                    camera_config[CONF_SOURCE_ENTITY],
+                    frame_path_for(self.config_entry.data[CONF_FRAME_DIR], path),
+                    camera_config[CONF_WAKE_DELAY],
                 )
+                cameras.append(camera_config)
                 self.hass.config_entries.async_update_entry(
                     self.config_entry,
                     data={**self.config_entry.data, CONF_CAMERAS: cameras},

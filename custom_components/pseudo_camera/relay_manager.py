@@ -55,6 +55,10 @@ class RelayManager:
         """Stop all ffmpeg publishers."""
         await self._backend.shutdown()
 
+    async def async_restart_streams(self) -> None:
+        """Restart pseudo publishers for all configured paths."""
+        await self._backend.bootstrap_pseudo_streams(list(self._cameras))
+
     async def start_relay(self, path: str, hls_url: str) -> None:
         """Start live relay for a path."""
         if path not in self._cameras:

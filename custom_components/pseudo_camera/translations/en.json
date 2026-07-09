@@ -21,7 +21,7 @@
       },
       "camera_menu": {
         "title": "Camera setup",
-        "description": "{count} camera(s) configured so far."
+        "description": "{count} camera(s) configured. Last added: {path}. {capture_status}"
       }
     },
     "error": {

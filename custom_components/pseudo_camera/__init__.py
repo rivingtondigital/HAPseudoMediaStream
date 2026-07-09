@@ -19,12 +19,28 @@ from .const import (
     DOMAIN,
 )
 from .device import async_register_hub_device
+from .frame_capture import async_capture_initial_frames
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.BINARY_SENSOR]
+
+
+async def _async_restart_streams(hass: HomeAssistant) -> None:
+    """Restart ffmpeg publishers for all config entries."""
+    for runtime in hass.data.get(DOMAIN, {}).values():
+        await runtime.relay_manager.async_restart_streams()
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register services once."""
+
+    async def async_restart(_call) -> None:
+        await _async_restart_streams(hass)
+
+    hass.services.async_register(DOMAIN, "restart_streams", async_restart)
 
 
 def _cameras_from_entry(entry: ConfigEntry) -> list[CameraConfig]:
@@ -54,6 +70,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async_register_hub_device(hass, entry)
 
+    capture_results = await async_capture_initial_frames(
+        hass,
+        entry.data[CONF_FRAME_DIR],
+        cameras,
+    )
+    for path, captured in capture_results.items():
+        if captured:
+            _LOGGER.info("Initial frame ready for %s", path)
+        else:
+            _LOGGER.warning(
+                "No initial frame for %s; pseudo stream will use lavfi until first relay ends",
+                path,
+            )
+
     relay_manager = RelayManager(
         mediamtx_host=entry.data[CONF_MEDIAMTX_HOST],
         mediamtx_rtsp_port=int(entry.data[CONF_MEDIAMTX_RTSP_PORT]),
@@ -67,6 +97,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         relay_manager=relay_manager,
         cameras=cameras,
     )
+
+    if not hass.services.has_service(DOMAIN, "restart_streams"):
+        _register_services(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _LOGGER.info("Pseudo Camera initialized with %s camera(s)", len(cameras))
