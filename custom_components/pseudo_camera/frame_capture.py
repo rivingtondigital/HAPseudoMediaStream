@@ -16,6 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .frame_utils import MIN_FRAME_BYTES, async_is_valid_jpeg, async_remove_invalid_frame
 from .local_ffmpeg_backend import FFMPEG_BIN
+from .stream_utils import ffmpeg_stream_input_args, ha_stream_needs_auth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -168,24 +169,21 @@ async def _capture_via_stream(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-protocol_whitelist",
-        "file,http,https,tcp,tls,crypto,rtsp",
-    ]
-    if stream_source.startswith(("http://", "https://")) and "/api/" in stream_source:
-        token = hass.auth.async_create_access_token(expire_hours=1)
-        cmd.extend(["-headers", f"Authorization: Bearer {token}\r\n"])
-    cmd.extend(
-        [
-            "-i",
+        *ffmpeg_stream_input_args(
             stream_source,
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            "-y",
-            str(tmp_output),
-        ]
-    )
+            hass.auth.async_create_access_token(expire_hours=1)
+            if ha_stream_needs_auth(stream_source)
+            else None,
+        ),
+        "-i",
+        stream_source,
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        "-y",
+        str(tmp_output),
+    ]
 
     try:
         process = await asyncio.create_subprocess_exec(

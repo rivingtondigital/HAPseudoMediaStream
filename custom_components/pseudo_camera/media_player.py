@@ -20,7 +20,7 @@ from .const import (
     ATTR_SOURCE_ENTITY,
     DOMAIN,
 )
-from .device import camera_device_info
+from .stream_utils import ha_stream_needs_auth
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus
 
@@ -105,8 +105,22 @@ class PseudoCameraMediaPlayer(MediaPlayerEntity):
         self, media_type: str, media_id: str, **kwargs: Any
     ) -> None:
         """Start relaying the provided HLS playlist to MediaMTX."""
-        _LOGGER.info("Starting relay for %s", self.path)
-        await self._relay_manager.start_relay(self.path, media_id)
+        _LOGGER.info(
+            "Relay play_media for %s (type=%s): %s",
+            self.path,
+            media_type,
+            media_id,
+        )
+        access_token = None
+        if ha_stream_needs_auth(media_id):
+            access_token = self.hass.auth.async_create_access_token(expire_hours=1)
+        try:
+            await self._relay_manager.start_relay(
+                self.path, media_id, access_token=access_token
+            )
+        except Exception:
+            _LOGGER.exception("Failed to start relay for %s", self.path)
+            raise
 
     async def async_media_stop(self) -> None:
         """Stop relay and restore pseudo stream."""

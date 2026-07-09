@@ -5,8 +5,11 @@
 paths:
   stairs_over_door:
     source: publisher
+    # Smooth micro-glitches for readers; does not help when no publisher at all.
+    readBufferCount: 512
 
   # Allow any additional paths created from the HA integration without
   # editing this file again.
   all_others:
     source: publisher
+    readBufferCount: 512

@@ -14,6 +14,7 @@ from typing import Literal
 
 from .const import DEFAULT_MEDIAMTX_RTMP_PORT
 from .frame_utils import async_is_valid_jpeg, async_remove_invalid_frame
+from .stream_utils import ffmpeg_stream_input_args
 from .types import PathStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ LAST_FRAME_CAPTURE_TIMEOUT = 5
 PROCESS_STOP_TIMEOUT = 10
 WATCHDOG_INTERVAL = 30
 PUBLISH_SETTLE_DELAY = 1.5
-RELAY_SWITCH_SETTLE_DELAY = 0.5
+PUBLISHER_VERIFY_DELAY = 0.75
 
 IntendedMode = Literal["pseudo", "relay"]
 StatusListener = Callable[[str, PathStatus], None]
@@ -165,7 +166,9 @@ class LocalFfmpegBackend:
             await self._stop_pseudo(state)
             await asyncio.sleep(PUBLISH_SETTLE_DELAY)
 
-            started = await self._start_pseudo_unlocked(state, image_path)
+            started = await self._start_pseudo_unlocked(
+                state, image_path, settle=False, stop_existing=False
+            )
             if not started and image_path:
                 _LOGGER.warning(
                     "Pseudo loop failed for %s using %s; falling back to lavfi",
@@ -174,7 +177,9 @@ class LocalFfmpegBackend:
                 )
                 await async_remove_invalid_frame(Path(image_path))
                 await asyncio.sleep(PUBLISH_SETTLE_DELAY)
-                started = await self._start_pseudo_unlocked(state, None)
+                started = await self._start_pseudo_unlocked(
+                    state, None, settle=False, stop_existing=False
+                )
 
             if not started:
                 _LOGGER.error("Failed to start pseudo stream for %s", path)
@@ -183,19 +188,20 @@ class LocalFfmpegBackend:
             _LOGGER.info("Started pseudo stream for %s using %s", path, source)
         self._notify(path)
 
-    async def start_relay(self, path: str, hls_url: str) -> None:
+    async def start_relay(
+        self, path: str, hls_url: str, access_token: str | None = None
+    ) -> None:
         """Publish a live HLS stream to the MediaMTX path."""
         state = self._paths[path]
         async with state.lock:
-            await self._stop_pseudo(state)
             await self._stop_relay(state)
-            await asyncio.sleep(RELAY_SWITCH_SETTLE_DELAY)
 
             cmd = [
                 FFMPEG_BIN,
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                *ffmpeg_stream_input_args(hls_url, access_token),
                 "-re",
                 "-i",
                 hls_url,
@@ -210,6 +216,8 @@ class LocalFfmpegBackend:
                 await self._stop_relay(state)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
             self._monitor_relay(state)
+            # Overlap handoff: relay is live on MediaMTX before pseudo is stopped.
+            await self._stop_pseudo(state)
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
             _LOGGER.info("Started relay for %s", path)
@@ -228,13 +236,23 @@ class LocalFfmpegBackend:
                 if captured:
                     state.frame_path = str(captured)
 
-                await self._stop_relay(state)
-                await asyncio.sleep(RELAY_SWITCH_SETTLE_DELAY)
-
                 image_path = await self._async_captured_frame(path)
-                await self._start_pseudo_unlocked(
-                    state, image_path, settle=False
+                started = await self._start_pseudo_unlocked(
+                    state,
+                    image_path,
+                    settle=False,
+                    stop_existing=False,
                 )
+                if not started and image_path:
+                    remove_path = Path(image_path)
+                    await async_remove_invalid_frame(remove_path)
+                    started = await self._start_pseudo_unlocked(
+                        state, None, settle=False, stop_existing=False
+                    )
+                # Overlap handoff: pseudo is live before relay is stopped.
+                await self._stop_relay(state)
+                if not started:
+                    _LOGGER.error("Failed to restore pseudo stream for %s", path)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
                 status = self._status(state)
@@ -263,11 +281,13 @@ class LocalFfmpegBackend:
         image_path: str | None = None,
         *,
         settle: bool = True,
+        stop_existing: bool = True,
     ) -> bool:
         if image_path is None:
             image_path = await self._async_captured_frame(state.path)
 
-        await self._stop_pseudo(state)
+        if stop_existing:
+            await self._stop_pseudo(state)
         if settle:
             await asyncio.sleep(PUBLISH_SETTLE_DELAY)
 
@@ -305,12 +325,14 @@ class LocalFfmpegBackend:
                     path,
                 )
                 await self._stop_relay(state)
-                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
-                await self._start_pseudo_unlocked(state, None)
+                await self._start_pseudo_unlocked(
+                    state, None, settle=False, stop_existing=False
+                )
             elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
-                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
-                await self._start_pseudo_unlocked(state, None)
+                await self._start_pseudo_unlocked(
+                    state, None, settle=False, stop_existing=False
+                )
         self._notify(path)
 
     async def _capture_last_frame(
@@ -419,7 +441,7 @@ class LocalFfmpegBackend:
     async def _verify_process(
         self, process: asyncio.subprocess.Process, label: str
     ) -> bool:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(PUBLISHER_VERIFY_DELAY)
         if process.returncode is not None:
             stderr = b""
             if process.stderr is not None:
@@ -492,13 +514,17 @@ class LocalFfmpegBackend:
                 return
             await asyncio.sleep(PUBLISH_SETTLE_DELAY)
             if kind == "pseudo":
-                await self._start_pseudo_unlocked(state, None)
+                await self._start_pseudo_unlocked(
+                    state, None, settle=False, stop_existing=False
+                )
             else:
                 _LOGGER.warning(
                     "Relay for %s ended; restoring pseudo stream",
                     state.path,
                 )
-                await self._start_pseudo_unlocked(state, None)
+                await self._start_pseudo_unlocked(
+                    state, None, settle=False, stop_existing=False
+                )
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
         self._notify(state.path)
