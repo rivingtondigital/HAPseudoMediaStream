@@ -12,7 +12,6 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -21,6 +20,7 @@ from .const import (
     ATTR_SOURCE_ENTITY,
     DOMAIN,
 )
+from .device import camera_device_info
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus
 
@@ -71,13 +71,7 @@ class PseudoCameraMediaPlayer(MediaPlayerEntity):
         self._attr_unique_id = f"{entry.entry_id}_{camera.path}"
         self._attr_name = f"MediaMTX {camera.path}"
         self._attr_has_entity_name = True
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_{camera.path}")},
-            name=f"Pseudo Camera {camera.path}",
-            manufacturer="Pseudo Camera",
-            model="MediaMTX Relay",
-            via_device=(DOMAIN, entry.entry_id),
-        )
+        self._attr_device_info = camera_device_info(entry, camera.path)
         self._relay_active = False
         self._frame_path: str | None = None
 

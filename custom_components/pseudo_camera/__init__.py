@@ -18,6 +18,7 @@ from .const import (
     CONF_WAKE_DELAY,
     DOMAIN,
 )
+from .device import async_register_hub_device
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData
 
@@ -50,6 +51,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data[CONF_MEDIAMTX_HOST],
         entry.data[CONF_MEDIAMTX_RTSP_PORT],
     )
+
+    async_register_hub_device(hass, entry)
 
     relay_manager = RelayManager(
         mediamtx_host=entry.data[CONF_MEDIAMTX_HOST],

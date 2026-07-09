@@ -5,10 +5,9 @@ from __future__ import annotations
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .device import camera_device_info
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus
 
@@ -54,9 +53,7 @@ class PseudoCameraRelayBinarySensor(BinarySensorEntity):
         self._attr_name = "Live relay"
         self._attr_has_entity_name = True
         self._attr_is_on = False
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_{camera.path}")},
-        )
+        self._attr_device_info = camera_device_info(entry, camera.path)
 
     @property
     def path(self) -> str:
