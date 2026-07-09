@@ -26,6 +26,13 @@ PROCESS_STOP_TIMEOUT = 10
 WATCHDOG_INTERVAL = 30
 PUBLISH_SETTLE_DELAY = 1.5
 PUBLISHER_VERIFY_DELAY = 0.75
+HANDOFF_GAP = 0.25
+
+# Shared output profile keeps Frigate's decoder stable across pseudo/relay swaps.
+OUTPUT_WIDTH = 1280
+OUTPUT_HEIGHT = 720
+OUTPUT_FPS = 10
+OUTPUT_GOP = OUTPUT_FPS
 
 IntendedMode = Literal["pseudo", "relay"]
 StatusListener = Callable[[str, PathStatus], None]
@@ -193,6 +200,10 @@ class LocalFfmpegBackend:
         state = self._paths[path]
         async with state.lock:
             await self._stop_relay(state)
+            # Stop pseudo before relay so Frigate gets a clean RTSP reconnect
+            # instead of a mid-stream codec change on the same session.
+            await self._stop_pseudo(state)
+            await asyncio.sleep(HANDOFF_GAP)
 
             cmd = [
                 FFMPEG_BIN,
@@ -203,8 +214,9 @@ class LocalFfmpegBackend:
                 "-re",
                 "-i",
                 hls_url,
-                "-c",
-                "copy",
+                *self._relay_video_args(),
+                "-max_muxing_queue_size",
+                "1024",
                 "-f",
                 "flv",
                 self._rtmp_publish_url(path),
@@ -214,8 +226,6 @@ class LocalFfmpegBackend:
                 await self._stop_relay(state)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
             self._monitor_relay(state)
-            # Overlap handoff: relay is live on MediaMTX before pseudo is stopped.
-            await self._stop_pseudo(state)
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
             _LOGGER.info("Started relay for %s", path)
@@ -235,6 +245,8 @@ class LocalFfmpegBackend:
                     state.frame_path = str(captured)
 
                 image_path = await self._async_captured_frame(path)
+                await self._stop_relay(state)
+                await asyncio.sleep(HANDOFF_GAP)
                 started = await self._start_pseudo_unlocked(
                     state,
                     image_path,
@@ -242,13 +254,10 @@ class LocalFfmpegBackend:
                     stop_existing=False,
                 )
                 if not started and image_path:
-                    remove_path = Path(image_path)
-                    await async_remove_invalid_frame(remove_path)
+                    await async_remove_invalid_frame(Path(image_path))
                     started = await self._start_pseudo_unlocked(
                         state, None, settle=False, stop_existing=False
                     )
-                # Overlap handoff: pseudo is live before relay is stopped.
-                await self._stop_relay(state)
                 if not started:
                     _LOGGER.error("Failed to restore pseudo stream for %s", path)
                 state.intended_mode = "pseudo"
@@ -323,6 +332,7 @@ class LocalFfmpegBackend:
                     path,
                 )
                 await self._stop_relay(state)
+                await asyncio.sleep(HANDOFF_GAP)
                 await self._start_pseudo_unlocked(
                     state, None, settle=False, stop_existing=False
                 )
@@ -391,6 +401,60 @@ class LocalFfmpegBackend:
             _LOGGER.warning("Frame capture timed out for %s", path)
             return None
 
+    def _output_scale_filter(self) -> str:
+        return (
+            f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={OUTPUT_FPS}"
+        )
+
+    def _output_video_args(self, *, static: bool) -> list[str]:
+        """Shared H.264 profile for pseudo and relay publishers."""
+        args = [
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "baseline",
+            "-preset",
+            "ultrafast",
+            "-bf",
+            "0",
+            "-sc_threshold",
+            "0",
+        ]
+        if static:
+            args.extend(
+                [
+                    "-b:v",
+                    "600k",
+                    "-g",
+                    "1",
+                    "-keyint_min",
+                    "1",
+                    "-x264-params",
+                    "scenecut=0",
+                ]
+            )
+        else:
+            args.extend(
+                [
+                    "-b:v",
+                    "1500k",
+                    "-g",
+                    str(OUTPUT_GOP),
+                    "-keyint_min",
+                    str(OUTPUT_GOP),
+                    "-force_key_frames",
+                    "expr:gte(t,n_forced*1)",
+                ]
+            )
+        return args
+
+    def _relay_video_args(self) -> list[str]:
+        return ["-vf", self._output_scale_filter(), *self._output_video_args(static=False)]
+
     def _pseudo_command(self, path: str, image_path: str | None) -> list[str]:
         cmd = [
             FFMPEG_BIN,
@@ -401,21 +465,19 @@ class LocalFfmpegBackend:
         ]
         if image_path:
             cmd.extend(["-loop", "1", "-i", image_path])
+            cmd.extend(["-vf", self._output_scale_filter()])
         else:
-            cmd.extend(["-f", "lavfi", "-i", "color=c=gray:s=1280x720:r=5"])
+            cmd.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"color=c=gray:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}",
+                ]
+            )
         cmd.extend(
             [
-                "-an",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "ultrafast",
-                "-b:v",
-                "600k",
-                "-g",
-                "25",
+                *self._output_video_args(static=True),
                 "-max_muxing_queue_size",
                 "1024",
                 "-f",
