@@ -2,7 +2,7 @@
 #
 # Start this stack FIRST — it creates the shared "camera-net" network.
 #
-#   docker compose up -d
+#   docker compose up -d --build
 #
 # Other stacks (HA, Frigate, Scrypted) join camera-net as an external network.
 # See docker/README.md for snippets.
@@ -23,9 +23,22 @@ services:
       - "8889:8889"   # WebRTC HTTP
     networks:
       - camera-net
-    # The default image is minimal (no wget/curl) and the API is disabled by
-    # default, so HTTP-based healthchecks always fail. RTSP on :8554 is the
-    # real liveness signal — verify with: nc -zv 127.0.0.1 8554
+
+  # Publishes gray fallback when MediaMTX reports no RTMP publisher on a path.
+  # HA pseudo/relay takes over automatically when it connects.
+  mtx-keepalive:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.keepalive
+    container_name: mtx-keepalive
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    networks:
+      - camera-net
+    environment:
+      KEEPALIVE_PATHS: stairs_over_door
+      MEDIAMTX_API: http://mediamtx:9997
 
 networks:
   camera-net:

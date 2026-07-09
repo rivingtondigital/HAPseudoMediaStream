@@ -20,11 +20,13 @@ from .types import PathStatus
 _LOGGER = logging.getLogger(__name__)
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
+PATH_PROBE_TIMEOUT = 5
 CAPTURE_TIMEOUT = 15
 LAST_FRAME_CAPTURE_TIMEOUT = 5
 PROCESS_STOP_TIMEOUT = 10
-WATCHDOG_INTERVAL = 30
-PUBLISH_SETTLE_DELAY = 1.5
+WATCHDOG_INTERVAL = 5
+PUBLISH_SETTLE_DELAY = 0.5
 PUBLISHER_VERIFY_DELAY = 0.75
 HANDOFF_GAP = 0.25
 
@@ -155,7 +157,7 @@ class LocalFfmpegBackend:
         await self.ensure_frame_dir()
         for path in paths:
             self.register_path(path)
-            await self.start_pseudo(path)
+            await self.start_pseudo(path, fresh=True)
             status = await self.get_status(path)
             _LOGGER.info(
                 "Path %s bootstrap: pseudo_active=%s relay_active=%s",
@@ -164,17 +166,18 @@ class LocalFfmpegBackend:
                 status.relay_active,
             )
 
-    async def start_pseudo(self, path: str) -> None:
+    async def start_pseudo(self, path: str, *, fresh: bool = False) -> None:
         """Publish pseudo stream (last captured frame or gray lavfi fallback)."""
         state = self._paths[path]
         image_path = await self._async_captured_frame(path)
         async with state.lock:
-            await self._stop_relay(state)
-            await self._stop_pseudo(state)
-            await asyncio.sleep(PUBLISH_SETTLE_DELAY)
+            if not fresh:
+                await self._stop_relay(state)
+                await self._stop_pseudo(state)
+                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
 
             started = await self._start_pseudo_unlocked(
-                state, image_path, settle=False, stop_existing=False
+                state, image_path, settle=False, stop_existing=not fresh
             )
             if not started and image_path:
                 _LOGGER.warning(
@@ -183,16 +186,15 @@ class LocalFfmpegBackend:
                     image_path,
                 )
                 await async_remove_invalid_frame(Path(image_path))
-                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
                 started = await self._start_pseudo_unlocked(
                     state, None, settle=False, stop_existing=False
                 )
 
             if not started:
                 _LOGGER.error("Failed to start pseudo stream for %s", path)
-
-            source = state.frame_path or "lavfi gray"
-            _LOGGER.info("Started pseudo stream for %s using %s", path, source)
+            else:
+                source = state.frame_path or "lavfi gray"
+                _LOGGER.info("Started pseudo stream for %s using %s", path, source)
         self._notify(path)
 
     async def start_relay(self, path: str, hls_url: str) -> None:
@@ -226,6 +228,7 @@ class LocalFfmpegBackend:
             state.relay_process = await self._spawn(cmd, f"relay:{path}")
             if not await self._verify_process(state.relay_process, f"relay:{path}"):
                 await self._stop_relay(state)
+                await self._restore_pseudo(state, None)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
             self._monitor_relay(state)
             state.intended_mode = "relay"
@@ -249,17 +252,7 @@ class LocalFfmpegBackend:
                 image_path = await self._async_captured_frame(path)
                 await self._stop_relay(state)
                 await asyncio.sleep(HANDOFF_GAP)
-                started = await self._start_pseudo_unlocked(
-                    state,
-                    image_path,
-                    settle=False,
-                    stop_existing=False,
-                )
-                if not started and image_path:
-                    await async_remove_invalid_frame(Path(image_path))
-                    started = await self._start_pseudo_unlocked(
-                        state, None, settle=False, stop_existing=False
-                    )
+                started = await self._restore_pseudo(state, image_path)
                 if not started:
                     _LOGGER.error("Failed to restore pseudo stream for %s", path)
                 state.intended_mode = "pseudo"
@@ -283,6 +276,22 @@ class LocalFfmpegBackend:
         state = self._paths[path]
         async with state.lock:
             return self._status(state)
+
+    async def _restore_pseudo(self, state: _PathState, image_path: str | None = None) -> bool:
+        """Start pseudo, falling back to lavfi gray if needed."""
+        started = await self._start_pseudo_unlocked(
+            state,
+            image_path,
+            settle=False,
+            stop_existing=False,
+        )
+        if started or not image_path:
+            return started
+
+        await async_remove_invalid_frame(Path(image_path))
+        return await self._start_pseudo_unlocked(
+            state, None, settle=False, stop_existing=False
+        )
 
     async def _start_pseudo_unlocked(
         self,
@@ -323,6 +332,34 @@ class LocalFfmpegBackend:
         except asyncio.CancelledError:
             raise
 
+    async def _async_path_is_readable(self, path: str) -> bool:
+        """Return True when MediaMTX is serving RTSP for the path."""
+        cmd = [
+            FFPROBE_BIN,
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            self._rtsp_read_url(path),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(),
+                timeout=PATH_PROBE_TIMEOUT,
+            )
+        except TimeoutError:
+            return False
+        return process.returncode == 0 and b"video" in stdout
+
     async def _check_path_health(self, path: str, state: _PathState) -> None:
         async with state.lock:
             status = self._status(state)
@@ -335,14 +372,19 @@ class LocalFfmpegBackend:
                 )
                 await self._stop_relay(state)
                 await asyncio.sleep(HANDOFF_GAP)
-                await self._start_pseudo_unlocked(
-                    state, None, settle=False, stop_existing=False
+                await self._restore_pseudo(state, None)
+            elif status.pseudo_active:
+                if await self._async_path_is_readable(path):
+                    return
+                _LOGGER.warning(
+                    "Pseudo ffmpeg for %s is running but RTSP path is down; restarting",
+                    path,
                 )
-            elif not status.pseudo_active:
+                await self._stop_pseudo(state)
+                await self._restore_pseudo(state, None)
+            else:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
-                await self._start_pseudo_unlocked(
-                    state, None, settle=False, stop_existing=False
-                )
+                await self._restore_pseudo(state, None)
         self._notify(path)
 
     async def _capture_last_frame(
@@ -412,19 +454,6 @@ class LocalFfmpegBackend:
             return f"{scale},fps={OUTPUT_FPS}"
         return scale
 
-    @staticmethod
-    def _escape_lavfi_path(path: str) -> str:
-        return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
-
-    def _pseudo_image_source(self, image_path: str) -> str:
-        """Lavfi movie source with monotonic PTS for static loops."""
-        escaped = self._escape_lavfi_path(image_path)
-        return (
-            f"movie=filename='{escaped}':loop=0,"
-            f"setpts=N/{OUTPUT_FPS}/TB,"
-            f"{self._output_scale_filter()}"
-        )
-
     def _output_video_args(self, *, static: bool) -> list[str]:
         """Shared H.264 profile for pseudo and relay publishers."""
         args = [
@@ -443,7 +472,7 @@ class LocalFfmpegBackend:
             "0",
             "-r",
             str(OUTPUT_FPS),
-            "-fps_mode",
+            "-vsync",
             "cfr",
             "-g",
             str(OUTPUT_GOP),
@@ -475,17 +504,25 @@ class LocalFfmpegBackend:
             "-re",
         ]
         if image_path:
-            cmd.extend(["-f", "lavfi", "-i", self._pseudo_image_source(image_path)])
+            cmd.extend(
+                [
+                    "-framerate",
+                    str(OUTPUT_FPS),
+                    "-loop",
+                    "1",
+                    "-i",
+                    image_path,
+                    "-vf",
+                    self._output_scale_filter(),
+                ]
+            )
         else:
             cmd.extend(
                 [
                     "-f",
                     "lavfi",
                     "-i",
-                    (
-                        f"color=c=gray:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS},"
-                        f"setpts=N/{OUTPUT_FPS}/TB"
-                    ),
+                    f"color=c=gray:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}",
                 ]
             )
         cmd.extend(
@@ -587,17 +624,13 @@ class LocalFfmpegBackend:
                 return
             await asyncio.sleep(HANDOFF_GAP)
             if kind == "pseudo":
-                await self._start_pseudo_unlocked(
-                    state, None, settle=False, stop_existing=False
-                )
+                await self._restore_pseudo(state, None)
             else:
                 _LOGGER.warning(
                     "Relay for %s ended; restoring pseudo stream",
                     state.path,
                 )
-                await self._start_pseudo_unlocked(
-                    state, None, settle=False, stop_existing=False
-                )
+                await self._restore_pseudo(state, None)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
         self._notify(state.path)

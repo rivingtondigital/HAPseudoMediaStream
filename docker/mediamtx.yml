@@ -2,6 +2,10 @@
 #
 # Add one explicit path per camera, or rely on all_others for any path name.
 
+# Control API for mtx-keepalive (listens on all interfaces inside the container).
+api: yes
+apiAddress: :9997
+
 paths:
   stairs_over_door:
     source: publisher
