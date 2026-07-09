@@ -12,10 +12,12 @@ from .const import (
     CONF_CAMERAS,
     CONF_FRAME_DIR,
     CONF_MEDIAMTX_HOST,
+    CONF_MEDIAMTX_RTMP_PORT,
     CONF_MEDIAMTX_RTSP_PORT,
     CONF_PATH,
     CONF_SOURCE_ENTITY,
     CONF_WAKE_DELAY,
+    DEFAULT_MEDIAMTX_RTMP_PORT,
     DOMAIN,
 )
 from .device import async_register_hub_device
@@ -85,16 +87,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
     mediamtx_host = entry.data[CONF_MEDIAMTX_HOST]
-    mediamtx_port = int(entry.data[CONF_MEDIAMTX_RTSP_PORT])
+    mediamtx_rtsp_port = int(entry.data[CONF_MEDIAMTX_RTSP_PORT])
+    mediamtx_rtmp_port = int(
+        entry.data.get(CONF_MEDIAMTX_RTMP_PORT, DEFAULT_MEDIAMTX_RTMP_PORT)
+    )
     _LOGGER.info(
-        "Starting pseudo streams -> rtsp://%s:%s/<path>",
+        "Starting pseudo streams -> publish rtmp://%s:%s/<path>, read rtsp://%s:%s/<path>",
         mediamtx_host,
-        mediamtx_port,
+        mediamtx_rtmp_port,
+        mediamtx_host,
+        mediamtx_rtsp_port,
     )
 
     relay_manager = RelayManager(
         mediamtx_host=mediamtx_host,
-        mediamtx_rtsp_port=mediamtx_port,
+        mediamtx_rtsp_port=mediamtx_rtsp_port,
+        mediamtx_rtmp_port=mediamtx_rtmp_port,
         frame_dir=entry.data[CONF_FRAME_DIR],
         cameras=cameras,
     )

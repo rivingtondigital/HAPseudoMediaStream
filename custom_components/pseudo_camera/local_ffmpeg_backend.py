@@ -12,15 +12,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .frame_utils import is_valid_jpeg, remove_invalid_frame
+from .const import DEFAULT_MEDIAMTX_RTMP_PORT
+from .frame_utils import async_is_valid_jpeg, async_remove_invalid_frame
 from .types import PathStatus
 
 _LOGGER = logging.getLogger(__name__)
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 CAPTURE_TIMEOUT = 15
+LAST_FRAME_CAPTURE_TIMEOUT = 5
 PROCESS_STOP_TIMEOUT = 10
 WATCHDOG_INTERVAL = 30
+PUBLISH_SETTLE_DELAY = 1.5
+RELAY_SWITCH_SETTLE_DELAY = 0.5
 
 IntendedMode = Literal["pseudo", "relay"]
 StatusListener = Callable[[str, PathStatus], None]
@@ -34,6 +38,8 @@ class _PathState:
     frame_path: str | None = None
     intended_mode: IntendedMode = "pseudo"
     last_hls_url: str | None = None
+    stopping_pseudo: bool = False
+    stopping_relay: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -45,10 +51,12 @@ class LocalFfmpegBackend:
         mediamtx_host: str,
         mediamtx_rtsp_port: int,
         frame_dir: str,
+        mediamtx_rtmp_port: int = DEFAULT_MEDIAMTX_RTMP_PORT,
         default_frame: str | None = None,
     ) -> None:
         self._host = mediamtx_host
-        self._port = mediamtx_rtsp_port
+        self._rtsp_port = mediamtx_rtsp_port
+        self._rtmp_port = mediamtx_rtmp_port
         self._frame_dir = Path(frame_dir)
         self._default_frame = default_frame or str(self._frame_dir / "default.jpg")
         self._paths: dict[str, _PathState] = {}
@@ -84,10 +92,8 @@ class LocalFfmpegBackend:
             if path in path_set:
                 continue
             async with state.lock:
-                await self._stop_process(state.relay_process)
-                await self._stop_process(state.pseudo_process)
-                state.relay_process = None
-                state.pseudo_process = None
+                await self._stop_relay(state)
+                await self._stop_pseudo(state)
             del self._paths[path]
 
         for path in paths:
@@ -105,17 +111,22 @@ class LocalFfmpegBackend:
         for listener in self._listeners:
             listener(path, status)
 
-    def _rtsp_url(self, path: str) -> str:
-        return f"rtsp://{self._host}:{self._port}/{path}"
+    def _rtsp_read_url(self, path: str) -> str:
+        """RTSP URL for reading from MediaMTX (frame capture, consumers)."""
+        return f"rtsp://{self._host}:{self._rtsp_port}/{path}"
+
+    def _rtmp_publish_url(self, path: str) -> str:
+        """RTMP URL for publishing to MediaMTX (more stable than RTSP publish)."""
+        return f"rtmp://{self._host}:{self._rtmp_port}/{path}"
 
     def _frame_path(self, path: str) -> Path:
         return self._frame_dir / f"{path}.jpg"
 
-    def _captured_frame(self, path: str) -> str | None:
+    async def _async_captured_frame(self, path: str) -> str | None:
         """Return a saved last-frame image for a path, if valid."""
         frame = self._frame_path(path)
-        remove_invalid_frame(frame)
-        if is_valid_jpeg(frame):
+        await async_remove_invalid_frame(frame)
+        if await async_is_valid_jpeg(frame):
             return str(frame)
         return None
 
@@ -123,45 +134,16 @@ class LocalFfmpegBackend:
         """Create the frame storage directory."""
         await asyncio.to_thread(self._frame_dir.mkdir, parents=True, exist_ok=True)
 
-    async def ensure_default_frame(self) -> None:
-        """Create a fallback frame if none exists yet."""
-        await self.ensure_frame_dir()
-        default = Path(self._default_frame)
-        if default.is_file() and default.stat().st_size > 0:
-            return
-
-        cmd = [
-            FFMPEG_BIN,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=gray:s=1280x720",
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            str(default),
-        ]
-        _LOGGER.info("Creating default pseudo frame at %s", default)
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            _LOGGER.error(
-                "Failed to create default frame %s: %s",
-                default,
-                stderr.decode(errors="replace").strip(),
-            )
-
     async def bootstrap_pseudo_streams(self, paths: list[str]) -> None:
         """Start pseudo publishers for all configured paths."""
-        _LOGGER.info("Using ffmpeg binary: %s", FFMPEG_BIN)
+        _LOGGER.info(
+            "Using ffmpeg binary: %s (publish rtmp://%s:%s/<path>, read rtsp://%s:%s/<path>)",
+            FFMPEG_BIN,
+            self._host,
+            self._rtmp_port,
+            self._host,
+            self._rtsp_port,
+        )
         await self.ensure_frame_dir()
         for path in paths:
             self.register_path(path)
@@ -177,11 +159,11 @@ class LocalFfmpegBackend:
     async def start_pseudo(self, path: str) -> None:
         """Publish pseudo stream (last captured frame or gray lavfi fallback)."""
         state = self._paths[path]
-        image_path = self._captured_frame(path)
+        image_path = await self._async_captured_frame(path)
         async with state.lock:
-            await self._stop_process(state.pseudo_process)
-            await self._stop_process(state.relay_process)
-            state.relay_process = None
+            await self._stop_relay(state)
+            await self._stop_pseudo(state)
+            await asyncio.sleep(PUBLISH_SETTLE_DELAY)
 
             started = await self._start_pseudo_unlocked(state, image_path)
             if not started and image_path:
@@ -190,7 +172,8 @@ class LocalFfmpegBackend:
                     path,
                     image_path,
                 )
-                remove_invalid_frame(Path(image_path))
+                await async_remove_invalid_frame(Path(image_path))
+                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
                 started = await self._start_pseudo_unlocked(state, None)
 
             if not started:
@@ -204,9 +187,9 @@ class LocalFfmpegBackend:
         """Publish a live HLS stream to the MediaMTX path."""
         state = self._paths[path]
         async with state.lock:
-            await self._stop_process(state.pseudo_process)
-            state.pseudo_process = None
-            await self._stop_process(state.relay_process)
+            await self._stop_pseudo(state)
+            await self._stop_relay(state)
+            await asyncio.sleep(RELAY_SWITCH_SETTLE_DELAY)
 
             cmd = [
                 FFMPEG_BIN,
@@ -219,16 +202,14 @@ class LocalFfmpegBackend:
                 "-c",
                 "copy",
                 "-f",
-                "rtsp",
-                "-rtsp_transport",
-                "tcp",
-                self._rtsp_url(path),
+                "flv",
+                self._rtmp_publish_url(path),
             ]
             state.relay_process = await self._spawn(cmd, f"relay:{path}")
             if not await self._verify_process(state.relay_process, f"relay:{path}"):
-                await self._stop_process(state.relay_process)
-                state.relay_process = None
+                await self._stop_relay(state)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
+            self._monitor_relay(state)
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
             _LOGGER.info("Started relay for %s", path)
@@ -241,14 +222,19 @@ class LocalFfmpegBackend:
             if state.relay_process is None:
                 status = self._status(state)
             else:
-                captured = await self._capture_last_frame(path)
+                captured = await self._capture_last_frame(
+                    path, timeout=LAST_FRAME_CAPTURE_TIMEOUT
+                )
                 if captured:
                     state.frame_path = str(captured)
 
-                await self._stop_process(state.relay_process)
-                state.relay_process = None
+                await self._stop_relay(state)
+                await asyncio.sleep(RELAY_SWITCH_SETTLE_DELAY)
 
-                await self._start_pseudo_unlocked(state, None)
+                image_path = await self._async_captured_frame(path)
+                await self._start_pseudo_unlocked(
+                    state, image_path, settle=False
+                )
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
                 status = self._status(state)
@@ -260,10 +246,8 @@ class LocalFfmpegBackend:
         await self.stop_watchdog()
         for state in self._paths.values():
             async with state.lock:
-                await self._stop_process(state.relay_process)
-                await self._stop_process(state.pseudo_process)
-                state.relay_process = None
-                state.pseudo_process = None
+                await self._stop_relay(state)
+                await self._stop_pseudo(state)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
 
@@ -274,21 +258,27 @@ class LocalFfmpegBackend:
             return self._status(state)
 
     async def _start_pseudo_unlocked(
-        self, state: _PathState, image_path: str | None = None
+        self,
+        state: _PathState,
+        image_path: str | None = None,
+        *,
+        settle: bool = True,
     ) -> bool:
         if image_path is None:
-            image_path = self._captured_frame(state.path)
+            image_path = await self._async_captured_frame(state.path)
 
-        await self._stop_process(state.pseudo_process)
+        await self._stop_pseudo(state)
+        if settle:
+            await asyncio.sleep(PUBLISH_SETTLE_DELAY)
 
         cmd = self._pseudo_command(state.path, image_path)
         state.pseudo_process = await self._spawn(cmd, f"pseudo:{state.path}")
         started = await self._verify_process(state.pseudo_process, f"pseudo:{state.path}")
         if not started:
-            await self._stop_process(state.pseudo_process)
-            state.pseudo_process = None
+            await self._stop_pseudo(state)
             return False
 
+        self._monitor_pseudo(state)
         state.frame_path = image_path
         state.intended_mode = "pseudo"
         state.last_hls_url = None
@@ -314,16 +304,18 @@ class LocalFfmpegBackend:
                     "Relay for %s exited unexpectedly; restoring pseudo stream",
                     path,
                 )
-                state.relay_process = None
+                await self._stop_relay(state)
+                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
                 await self._start_pseudo_unlocked(state, None)
-                state.intended_mode = "pseudo"
-                state.last_hls_url = None
             elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
+                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
                 await self._start_pseudo_unlocked(state, None)
         self._notify(path)
 
-    async def _capture_last_frame(self, path: str) -> Path | None:
+    async def _capture_last_frame(
+        self, path: str, *, timeout: int = CAPTURE_TIMEOUT
+    ) -> Path | None:
         """Grab one frame from the live MediaMTX path before stopping relay."""
         await self.ensure_frame_dir()
         output = self._frame_path(path)
@@ -337,7 +329,7 @@ class LocalFfmpegBackend:
             "-rtsp_transport",
             "tcp",
             "-i",
-            self._rtsp_url(path),
+            self._rtsp_read_url(path),
             "-frames:v",
             "1",
             "-update",
@@ -357,7 +349,7 @@ class LocalFfmpegBackend:
             )
             _, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=CAPTURE_TIMEOUT,
+                timeout=timeout,
             )
             if process.returncode != 0:
                 _LOGGER.warning(
@@ -369,9 +361,9 @@ class LocalFfmpegBackend:
                 return None
 
             await asyncio.to_thread(tmp_output.replace, output)
-            if not is_valid_jpeg(output):
+            if not await async_is_valid_jpeg(output):
                 _LOGGER.warning("Last-frame capture produced invalid JPEG for %s", path)
-                output.unlink(missing_ok=True)
+                await asyncio.to_thread(output.unlink, missing_ok=True)
                 return None
             _LOGGER.info("Captured last frame for %s at %s", path, output)
             return output
@@ -407,10 +399,8 @@ class LocalFfmpegBackend:
                 "-max_muxing_queue_size",
                 "1024",
                 "-f",
-                "rtsp",
-                "-rtsp_transport",
-                "tcp",
-                self._rtsp_url(path),
+                "flv",
+                self._rtmp_publish_url(path),
             ]
         )
         return cmd
@@ -441,25 +431,93 @@ class LocalFfmpegBackend:
                 stderr.decode(errors="replace").strip(),
             )
             return False
-
-        asyncio.create_task(self._monitor_process(process, label))
         return True
 
+    def _monitor_pseudo(self, state: _PathState) -> None:
+        process = state.pseudo_process
+        if process is None:
+            return
+        asyncio.create_task(self._monitor_process(process, f"pseudo:{state.path}", "pseudo", state))
+
+    def _monitor_relay(self, state: _PathState) -> None:
+        process = state.relay_process
+        if process is None:
+            return
+        asyncio.create_task(self._monitor_process(process, f"relay:{state.path}", "relay", state))
+
     async def _monitor_process(
-        self, process: asyncio.subprocess.Process, label: str
+        self,
+        process: asyncio.subprocess.Process,
+        label: str,
+        kind: Literal["pseudo", "relay"],
+        state: _PathState,
     ) -> None:
         if process.stderr is None:
-            await process.wait()
+            returncode = await process.wait()
+            stderr_text = ""
+        else:
+            stderr = await process.stderr.read()
+            returncode = await process.wait()
+            stderr_text = stderr.decode(errors="replace").strip()
+
+        intentional = state.stopping_pseudo if kind == "pseudo" else state.stopping_relay
+        active = state.pseudo_process if kind == "pseudo" else state.relay_process
+        if active is not process:
             return
-        stderr = await process.stderr.read()
-        returncode = await process.wait()
+
+        if kind == "pseudo":
+            state.pseudo_process = None
+        else:
+            state.relay_process = None
+
+        if intentional:
+            if returncode not in (0, -15, 255):
+                _LOGGER.debug("%s stopped (code %s)", label, returncode)
+            return
+
         if returncode != 0:
-            _LOGGER.error(
-                "%s exited (code %s): %s",
+            _LOGGER.warning(
+                "%s exited unexpectedly (code %s): %s",
                 label,
                 returncode,
-                stderr.decode(errors="replace").strip(),
+                stderr_text,
             )
+
+        if state.intended_mode != kind:
+            return
+
+        _LOGGER.info("Restarting %s for %s after publisher exit", kind, state.path)
+        async with state.lock:
+            if state.intended_mode != kind:
+                return
+            await asyncio.sleep(PUBLISH_SETTLE_DELAY)
+            if kind == "pseudo":
+                await self._start_pseudo_unlocked(state, None)
+            else:
+                _LOGGER.warning(
+                    "Relay for %s ended; restoring pseudo stream",
+                    state.path,
+                )
+                await self._start_pseudo_unlocked(state, None)
+                state.intended_mode = "pseudo"
+                state.last_hls_url = None
+        self._notify(state.path)
+
+    async def _stop_pseudo(self, state: _PathState) -> None:
+        state.stopping_pseudo = True
+        try:
+            await self._stop_process(state.pseudo_process)
+        finally:
+            state.stopping_pseudo = False
+            state.pseudo_process = None
+
+    async def _stop_relay(self, state: _PathState) -> None:
+        state.stopping_relay = True
+        try:
+            await self._stop_process(state.relay_process)
+        finally:
+            state.stopping_relay = False
+            state.relay_process = None
 
     async def _stop_process(self, process: asyncio.subprocess.Process | None) -> None:
         if process is None:

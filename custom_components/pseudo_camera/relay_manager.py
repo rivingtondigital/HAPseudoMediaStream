@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from .const import DEFAULT_MEDIAMTX_RTMP_PORT
 from .local_ffmpeg_backend import LocalFfmpegBackend
 from .types import CameraConfig, PathStatus
 
@@ -22,10 +23,12 @@ class RelayManager:
         mediamtx_rtsp_port: int,
         frame_dir: str,
         cameras: list[CameraConfig],
+        mediamtx_rtmp_port: int = DEFAULT_MEDIAMTX_RTMP_PORT,
     ) -> None:
         self._backend = LocalFfmpegBackend(
             mediamtx_host=mediamtx_host,
             mediamtx_rtsp_port=mediamtx_rtsp_port,
+            mediamtx_rtmp_port=mediamtx_rtmp_port,
             frame_dir=frame_dir,
         )
         self._cameras = {camera.path: camera for camera in cameras}
