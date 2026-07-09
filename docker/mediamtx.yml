@@ -3,6 +3,9 @@
 # HA is the sole RTMP publisher (pseudo/relay). alwaysAvailable keeps Frigate's
 # reader session alive across brief publisher gaps; overridePublisher enables
 # make-before-break handoffs between HA publishers.
+#
+# alwaysAvailable is only valid on concrete path names — never pathDefaults,
+# all, all_others, or regex paths.
 
 logLevel: info
 logDestinations: [stdout, file]
@@ -28,15 +31,10 @@ apiAddress: :9997
 
 pathDefaults:
   overridePublisher: true
-  alwaysAvailable: true
-  alwaysAvailableTracks:
-    - codec: H264
-  # Matches HA pseudo/relay profile (1280x720 H264 baseline, no audio).
-  alwaysAvailableFile: /offline/gray_720p.mp4
+  source: publisher
 
 paths:
   stairs_over_door:
-    source: publisher
-
-  all_others:
-    source: publisher
+    alwaysAvailable: true
+    alwaysAvailableTracks:
+      - codec: H264

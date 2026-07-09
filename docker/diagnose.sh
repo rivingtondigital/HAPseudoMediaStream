@@ -21,10 +21,6 @@ grep -E 'alwaysAvailable|authInternalUsers|overridePublisher' -A6 docker/mediamt
   || echo "(docker/mediamtx.yml missing)"
 
 echo ""
-echo "=== offline segment ==="
-ls -la docker/offline/gray_720p.mp4 2>/dev/null || echo "(missing — run: docker compose up offline-init)"
-
-echo ""
 echo "=== path status (API) ==="
 curl -sf http://127.0.0.1:9997/v3/paths/get/stairs_over_door 2>/dev/null \
   || echo "(API auth failed or unreachable — check auth block was loaded; run: docker compose up -d --force-recreate mediamtx)"
@@ -49,5 +45,5 @@ echo "A third publisher IP fighting HA means something else is still publishing.
 echo ""
 echo "=== common failures ==="
 echo "- Restart loop: old mediamtx.yml with readBufferCount or runOnInit (fixed in repo)"
-echo "- Missing offline: docker compose up offline-init"
+echo "- Stale keepalive: docker rm -f mtx-keepalive"
 echo "- Port in use:   ss -tlnp | grep -E '8554|1935'"
