@@ -84,13 +84,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 path,
             )
 
+    mediamtx_host = entry.data[CONF_MEDIAMTX_HOST]
+    mediamtx_port = int(entry.data[CONF_MEDIAMTX_RTSP_PORT])
+    _LOGGER.info(
+        "Starting pseudo streams -> rtsp://%s:%s/<path>",
+        mediamtx_host,
+        mediamtx_port,
+    )
+
     relay_manager = RelayManager(
-        mediamtx_host=entry.data[CONF_MEDIAMTX_HOST],
-        mediamtx_rtsp_port=int(entry.data[CONF_MEDIAMTX_RTSP_PORT]),
+        mediamtx_host=mediamtx_host,
+        mediamtx_rtsp_port=mediamtx_port,
         frame_dir=entry.data[CONF_FRAME_DIR],
         cameras=cameras,
     )
-    await relay_manager.async_setup()
+    try:
+        await relay_manager.async_setup()
+    except Exception:
+        _LOGGER.exception("Failed to start pseudo camera ffmpeg publishers")
+        return False
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = IntegrationRuntimeData(

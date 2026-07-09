@@ -6,16 +6,20 @@ import asyncio
 import logging
 from pathlib import Path
 
-from homeassistant.components.camera import async_get_image, async_get_stream_source
+from homeassistant.components.camera import (
+    DOMAIN as CAMERA_DOMAIN,
+    async_get_image,
+    async_get_stream_source,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from .frame_utils import MIN_FRAME_BYTES, is_valid_jpeg, remove_invalid_frame
 from .local_ffmpeg_backend import FFMPEG_BIN
 
 _LOGGER = logging.getLogger(__name__)
 
-CAPTURE_TIMEOUT = 30
-MIN_FRAME_BYTES = 100
+CAPTURE_TIMEOUT = 45
 
 
 def frame_path_for(frame_dir: str, path: str) -> Path:
@@ -32,7 +36,9 @@ async def async_capture_initial_frames(
     results: dict[str, bool] = {}
     for camera in cameras:
         output_path = frame_path_for(frame_dir, camera.path)
-        if output_path.is_file() and output_path.stat().st_size >= MIN_FRAME_BYTES:
+        remove_invalid_frame(output_path)
+        if is_valid_jpeg(output_path):
+            _LOGGER.info("Reusing existing frame for %s at %s", camera.path, output_path)
             results[camera.path] = True
             continue
         results[camera.path] = await async_capture_camera_frame(
@@ -52,6 +58,7 @@ async def async_capture_camera_frame(
 ) -> bool:
     """Capture one frame from a camera entity and save it as a JPEG."""
     await asyncio.to_thread(output_path.parent.mkdir, parents=True, exist_ok=True)
+    remove_invalid_frame(output_path)
 
     if wake_delay > 0:
         _LOGGER.info(
@@ -61,17 +68,53 @@ async def async_capture_camera_frame(
         )
         await asyncio.sleep(wake_delay)
 
-    if await _capture_via_snapshot(hass, source_entity, output_path):
-        return True
+    methods = (
+        _capture_via_snapshot_service,
+        _capture_via_snapshot,
+        _capture_via_stream,
+    )
+    for method in methods:
+        if await method(hass, source_entity, output_path):
+            return True
 
-    if await _capture_via_stream(hass, source_entity, output_path):
-        return True
-
+    remove_invalid_frame(output_path)
     _LOGGER.warning(
         "Initial frame capture failed for %s; pseudo stream will use lavfi fallback",
         source_entity,
     )
     return False
+
+
+async def _capture_via_snapshot_service(
+    hass: HomeAssistant,
+    source_entity: str,
+    output_path: Path,
+) -> bool:
+    """Try the camera.snapshot service, which handles stream auth internally."""
+    tmp_output = output_path.with_suffix(".tmp.jpg")
+    remove_invalid_frame(tmp_output)
+    try:
+        await hass.services.async_call(
+            CAMERA_DOMAIN,
+            "snapshot",
+            {"entity_id": source_entity, "filename": str(tmp_output)},
+            blocking=True,
+        )
+    except HomeAssistantError as err:
+        _LOGGER.warning("camera.snapshot failed for %s: %s", source_entity, err)
+        return False
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("Unexpected camera.snapshot error for %s: %s", source_entity, err)
+        return False
+
+    if not is_valid_jpeg(tmp_output):
+        _LOGGER.warning("camera.snapshot produced invalid JPEG for %s", source_entity)
+        tmp_output.unlink(missing_ok=True)
+        return False
+
+    await asyncio.to_thread(tmp_output.replace, output_path)
+    _LOGGER.info("Captured initial frame via camera.snapshot at %s", output_path)
+    return True
 
 
 async def _capture_via_snapshot(
@@ -83,18 +126,24 @@ async def _capture_via_snapshot(
     try:
         image = await async_get_image(hass, source_entity)
     except HomeAssistantError as err:
-        _LOGGER.debug("Snapshot API failed for %s: %s", source_entity, err)
+        _LOGGER.warning("Snapshot API failed for %s: %s", source_entity, err)
         return False
     except Exception as err:  # noqa: BLE001
-        _LOGGER.debug("Unexpected snapshot error for %s: %s", source_entity, err)
+        _LOGGER.warning("Unexpected snapshot error for %s: %s", source_entity, err)
         return False
 
     if not image.content or len(image.content) < MIN_FRAME_BYTES:
-        _LOGGER.debug("Snapshot for %s was empty", source_entity)
+        _LOGGER.warning("Snapshot for %s was empty", source_entity)
         return False
 
     await asyncio.to_thread(output_path.write_bytes, image.content)
-    return _validate_frame(output_path)
+    if not is_valid_jpeg(output_path):
+        _LOGGER.warning("Snapshot API returned invalid JPEG for %s", source_entity)
+        output_path.unlink(missing_ok=True)
+        return False
+
+    _LOGGER.info("Captured initial frame via snapshot API at %s", output_path)
+    return True
 
 
 async def _capture_via_stream(
@@ -106,11 +155,11 @@ async def _capture_via_stream(
     try:
         stream_source = await async_get_stream_source(hass, source_entity)
     except HomeAssistantError as err:
-        _LOGGER.debug("Stream source unavailable for %s: %s", source_entity, err)
+        _LOGGER.warning("Stream source unavailable for %s: %s", source_entity, err)
         return False
 
     if not stream_source:
-        _LOGGER.debug("No stream source for %s", source_entity)
+        _LOGGER.warning("No stream source for %s", source_entity)
         return False
 
     tmp_output = output_path.with_suffix(".tmp.jpg")
@@ -121,15 +170,22 @@ async def _capture_via_stream(
         "error",
         "-protocol_whitelist",
         "file,http,https,tcp,tls,crypto,rtsp",
-        "-i",
-        stream_source,
-        "-frames:v",
-        "1",
-        "-update",
-        "1",
-        "-y",
-        str(tmp_output),
     ]
+    if stream_source.startswith(("http://", "https://")) and "/api/" in stream_source:
+        token = hass.auth.async_create_access_token(expire_hours=1)
+        cmd.extend(["-headers", f"Authorization: Bearer {token}\r\n"])
+    cmd.extend(
+        [
+            "-i",
+            stream_source,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-y",
+            str(tmp_output),
+        ]
+    )
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -142,7 +198,7 @@ async def _capture_via_stream(
             timeout=CAPTURE_TIMEOUT,
         )
         if process.returncode != 0:
-            _LOGGER.debug(
+            _LOGGER.warning(
                 "ffmpeg frame capture failed for %s: %s",
                 source_entity,
                 stderr.decode(errors="replace").strip(),
@@ -151,18 +207,13 @@ async def _capture_via_stream(
             return False
 
         await asyncio.to_thread(tmp_output.replace, output_path)
-        return _validate_frame(output_path)
+        if not is_valid_jpeg(output_path):
+            _LOGGER.warning("ffmpeg produced invalid JPEG for %s", source_entity)
+            output_path.unlink(missing_ok=True)
+            return False
+
+        _LOGGER.info("Captured initial frame via stream at %s", output_path)
+        return True
     except TimeoutError:
-        _LOGGER.debug("ffmpeg frame capture timed out for %s", source_entity)
+        _LOGGER.warning("ffmpeg frame capture timed out for %s", source_entity)
         return False
-
-
-def _validate_frame(output_path: Path) -> bool:
-    """Return True if the saved frame looks usable."""
-    if not output_path.is_file():
-        return False
-    if output_path.stat().st_size < MIN_FRAME_BYTES:
-        _LOGGER.debug("Captured frame too small: %s", output_path)
-        return False
-    _LOGGER.info("Captured initial frame at %s", output_path)
-    return True

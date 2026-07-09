@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .frame_utils import is_valid_jpeg, remove_invalid_frame
 from .types import PathStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,7 +114,8 @@ class LocalFfmpegBackend:
     def _captured_frame(self, path: str) -> str | None:
         """Return a saved last-frame image for a path, if valid."""
         frame = self._frame_path(path)
-        if frame.is_file() and frame.stat().st_size > 100:
+        remove_invalid_frame(frame)
+        if is_valid_jpeg(frame):
             return str(frame)
         return None
 
@@ -181,13 +183,20 @@ class LocalFfmpegBackend:
             await self._stop_process(state.relay_process)
             state.relay_process = None
 
-            cmd = self._pseudo_command(path, image_path)
-            state.pseudo_process = await self._spawn(cmd, f"pseudo:{path}")
-            await self._verify_process(state.pseudo_process, f"pseudo:{path}")
-            state.frame_path = image_path
-            state.intended_mode = "pseudo"
-            state.last_hls_url = None
-            source = image_path or "lavfi gray"
+            started = await self._start_pseudo_unlocked(state, image_path)
+            if not started and image_path:
+                _LOGGER.warning(
+                    "Pseudo loop failed for %s using %s; falling back to lavfi",
+                    path,
+                    image_path,
+                )
+                remove_invalid_frame(Path(image_path))
+                started = await self._start_pseudo_unlocked(state, None)
+
+            if not started:
+                _LOGGER.error("Failed to start pseudo stream for %s", path)
+
+            source = state.frame_path or "lavfi gray"
             _LOGGER.info("Started pseudo stream for %s using %s", path, source)
         self._notify(path)
 
@@ -216,7 +225,10 @@ class LocalFfmpegBackend:
                 self._rtsp_url(path),
             ]
             state.relay_process = await self._spawn(cmd, f"relay:{path}")
-            await self._verify_process(state.relay_process, f"relay:{path}")
+            if not await self._verify_process(state.relay_process, f"relay:{path}"):
+                await self._stop_process(state.relay_process)
+                state.relay_process = None
+                raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
             state.intended_mode = "relay"
             state.last_hls_url = hls_url
             _LOGGER.info("Started relay for %s", path)
@@ -236,7 +248,7 @@ class LocalFfmpegBackend:
                 await self._stop_process(state.relay_process)
                 state.relay_process = None
 
-                await self._start_pseudo_unlocked(state)
+                await self._start_pseudo_unlocked(state, None)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
                 status = self._status(state)
@@ -261,15 +273,26 @@ class LocalFfmpegBackend:
         async with state.lock:
             return self._status(state)
 
-    async def _start_pseudo_unlocked(self, state: _PathState) -> None:
-        image_path = self._captured_frame(state.path)
+    async def _start_pseudo_unlocked(
+        self, state: _PathState, image_path: str | None = None
+    ) -> bool:
+        if image_path is None:
+            image_path = self._captured_frame(state.path)
+
         await self._stop_process(state.pseudo_process)
 
         cmd = self._pseudo_command(state.path, image_path)
         state.pseudo_process = await self._spawn(cmd, f"pseudo:{state.path}")
-        await self._verify_process(state.pseudo_process, f"pseudo:{state.path}")
+        started = await self._verify_process(state.pseudo_process, f"pseudo:{state.path}")
+        if not started:
+            await self._stop_process(state.pseudo_process)
+            state.pseudo_process = None
+            return False
+
         state.frame_path = image_path
         state.intended_mode = "pseudo"
+        state.last_hls_url = None
+        return True
 
     async def _watchdog_loop(self) -> None:
         """Restart ffmpeg publishers that exit unexpectedly."""
@@ -292,12 +315,12 @@ class LocalFfmpegBackend:
                     path,
                 )
                 state.relay_process = None
-                await self._start_pseudo_unlocked(state)
+                await self._start_pseudo_unlocked(state, None)
                 state.intended_mode = "pseudo"
                 state.last_hls_url = None
             elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
-                await self._start_pseudo_unlocked(state)
+                await self._start_pseudo_unlocked(state, None)
         self._notify(path)
 
     async def _capture_last_frame(self, path: str) -> Path | None:
@@ -346,6 +369,10 @@ class LocalFfmpegBackend:
                 return None
 
             await asyncio.to_thread(tmp_output.replace, output)
+            if not is_valid_jpeg(output):
+                _LOGGER.warning("Last-frame capture produced invalid JPEG for %s", path)
+                output.unlink(missing_ok=True)
+                return None
             _LOGGER.info("Captured last frame for %s at %s", path, output)
             return output
         except TimeoutError:
@@ -392,19 +419,17 @@ class LocalFfmpegBackend:
         self, cmd: list[str], label: str
     ) -> asyncio.subprocess.Process:
         _LOGGER.info("Starting %s: %s", label, " ".join(cmd))
-        process = await asyncio.create_subprocess_exec(
+        return await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        asyncio.create_task(self._monitor_process(process, label))
-        return process
 
     async def _verify_process(
         self, process: asyncio.subprocess.Process, label: str
-    ) -> None:
-        await asyncio.sleep(0.5)
+    ) -> bool:
+        await asyncio.sleep(1.0)
         if process.returncode is not None:
             stderr = b""
             if process.stderr is not None:
@@ -415,6 +440,10 @@ class LocalFfmpegBackend:
                 process.returncode,
                 stderr.decode(errors="replace").strip(),
             )
+            return False
+
+        asyncio.create_task(self._monitor_process(process, label))
+        return True
 
     async def _monitor_process(
         self, process: asyncio.subprocess.Process, label: str
