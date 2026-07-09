@@ -26,9 +26,9 @@ PROCESS_STOP_TIMEOUT = 10
 WATCHDOG_INTERVAL = 30
 PUBLISH_SETTLE_DELAY = 0.5
 PUBLISHER_VERIFY_DELAY = 0.75
-HANDOFF_GAP = 0.25
 
 # Shared output profile keeps Frigate's decoder stable across pseudo/relay swaps.
+# MediaMTX alwaysAvailable + overridePublisher keep the reader session continuous.
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
 OUTPUT_FPS = 10
@@ -169,13 +169,16 @@ class LocalFfmpegBackend:
         state = self._paths[path]
         image_path = await self._async_captured_frame(path)
         async with state.lock:
+            previous_relay = None
+            previous_pseudo = None
             if not fresh:
-                await self._stop_relay(state)
-                await self._stop_pseudo(state)
-                await asyncio.sleep(PUBLISH_SETTLE_DELAY)
+                previous_relay = state.relay_process
+                previous_pseudo = state.pseudo_process
+                state.relay_process = None
+                state.pseudo_process = None
 
             started = await self._start_pseudo_unlocked(
-                state, image_path, settle=False, stop_existing=not fresh
+                state, image_path, settle=False, stop_existing=False
             )
             if not started and image_path:
                 _LOGGER.warning(
@@ -190,20 +193,37 @@ class LocalFfmpegBackend:
 
             if not started:
                 _LOGGER.error("Failed to start pseudo stream for %s", path)
+                if state.pseudo_process is None and previous_pseudo is not None:
+                    state.pseudo_process = previous_pseudo
+                    self._monitor_pseudo(state)
+                    previous_pseudo = None
+                if state.relay_process is None and previous_relay is not None:
+                    state.relay_process = previous_relay
+                    state.intended_mode = "relay"
+                    self._monitor_relay(state)
+                    previous_relay = None
             else:
                 source = state.frame_path or "lavfi gray"
                 _LOGGER.info("Started pseudo stream for %s using %s", path, source)
+                await self._stop_process(previous_pseudo)
+                await self._stop_process(previous_relay)
         self._notify(path)
 
     async def start_relay(self, path: str, hls_url: str) -> None:
-        """Publish a live HLS stream to the MediaMTX path."""
+        """Publish a live HLS stream to the MediaMTX path.
+
+        Make-before-break: start relay while the current publisher is still up;
+        MediaMTX overridePublisher displaces it so Frigate keeps one session.
+        """
         state = self._paths[path]
         async with state.lock:
-            await self._stop_relay(state)
-            # Stop pseudo before relay so Frigate gets a clean RTSP reconnect
-            # instead of a mid-stream codec change on the same session.
-            await self._stop_pseudo(state)
-            await asyncio.sleep(HANDOFF_GAP)
+            previous_relay = state.relay_process
+            previous_pseudo = state.pseudo_process
+            # Detach so displaced-process monitors do not restart them.
+            state.relay_process = None
+            state.pseudo_process = None
+            state.intended_mode = "relay"
+            state.last_hls_url = hls_url
 
             cmd = [
                 FFMPEG_BIN,
@@ -226,16 +246,19 @@ class LocalFfmpegBackend:
             state.relay_process = await self._spawn(cmd, f"relay:{path}")
             if not await self._verify_process(state.relay_process, f"relay:{path}"):
                 await self._stop_relay(state)
+                await self._stop_process(previous_pseudo)
+                await self._stop_process(previous_relay)
                 await self._restore_pseudo(state, None)
                 raise RuntimeError(f"Relay ffmpeg exited immediately for {path}")
+
             self._monitor_relay(state)
-            state.intended_mode = "relay"
-            state.last_hls_url = hls_url
-            _LOGGER.info("Started relay for %s", path)
+            await self._stop_process(previous_pseudo)
+            await self._stop_process(previous_relay)
+            _LOGGER.info("Started relay for %s (make-before-break)", path)
         self._notify(path)
 
     async def stop_relay(self, path: str) -> PathStatus:
-        """Stop live relay, capture last frame, and return to pseudo."""
+        """Capture last frame, then make-before-break back to pseudo."""
         state = self._paths[path]
         async with state.lock:
             if state.relay_process is None:
@@ -248,13 +271,16 @@ class LocalFfmpegBackend:
                     state.frame_path = str(captured)
 
                 image_path = await self._async_captured_frame(path)
-                await self._stop_relay(state)
-                await asyncio.sleep(HANDOFF_GAP)
+                previous_relay = state.relay_process
+                # Detach so the relay monitor does not fight the handoff.
+                state.relay_process = None
+                state.intended_mode = "pseudo"
+                state.last_hls_url = None
+
                 started = await self._restore_pseudo(state, image_path)
                 if not started:
                     _LOGGER.error("Failed to restore pseudo stream for %s", path)
-                state.intended_mode = "pseudo"
-                state.last_hls_url = None
+                await self._stop_process(previous_relay)
                 status = self._status(state)
         self._notify(path)
         return status
@@ -341,7 +367,6 @@ class LocalFfmpegBackend:
                     path,
                 )
                 await self._stop_relay(state)
-                await asyncio.sleep(HANDOFF_GAP)
                 await self._restore_pseudo(state, None)
             elif not status.pseudo_active:
                 _LOGGER.warning("Pseudo stream for %s exited; restarting", path)
@@ -583,7 +608,6 @@ class LocalFfmpegBackend:
         async with state.lock:
             if state.intended_mode != kind:
                 return
-            await asyncio.sleep(HANDOFF_GAP)
             if kind == "pseudo":
                 await self._restore_pseudo(state, None)
             else:
