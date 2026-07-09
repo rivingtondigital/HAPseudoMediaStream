@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import DOMAIN
 from .device import camera_device_info
 from .relay_manager import RelayManager
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus

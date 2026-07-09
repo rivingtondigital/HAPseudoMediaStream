@@ -50,7 +50,7 @@ class PseudoCameraConfigFlow(ConfigFlow, domain=DOMAIN):
         """Configure the MediaMTX server."""
         if user_input is not None:
             self._mediamtx_host = user_input[CONF_MEDIAMTX_HOST]
-            self._mediamtx_rtsp_port = user_input[CONF_MEDIAMTX_RTSP_PORT]
+            self._mediamtx_rtsp_port = int(user_input[CONF_MEDIAMTX_RTSP_PORT])
             self._frame_dir = user_input[CONF_FRAME_DIR]
             return await self.async_step_camera()
 

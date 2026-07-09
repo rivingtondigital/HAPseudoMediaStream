@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_MEDIAMTX_HOST, CONF_MEDIAMTX_RTSP_PORT, DOMAIN
+from .const import DOMAIN
 
 
 def async_register_hub_device(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -24,13 +24,10 @@ def async_register_hub_device(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 def camera_device_info(entry: ConfigEntry, path: str) -> DeviceInfo:
     """Return device info for a camera path."""
-    host = entry.data[CONF_MEDIAMTX_HOST]
-    port = entry.data[CONF_MEDIAMTX_RTSP_PORT]
     return DeviceInfo(
         identifiers={(DOMAIN, f"{entry.entry_id}_{path}")},
         name=f"Pseudo Camera {path}",
         manufacturer="Pseudo Camera",
         model="MediaMTX Relay",
         via_device=(DOMAIN, entry.entry_id),
-        configuration_url=f"rtsp://{host}:{port}/{path}",
     )

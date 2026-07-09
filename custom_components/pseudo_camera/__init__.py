@@ -56,7 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     relay_manager = RelayManager(
         mediamtx_host=entry.data[CONF_MEDIAMTX_HOST],
-        mediamtx_rtsp_port=entry.data[CONF_MEDIAMTX_RTSP_PORT],
+        mediamtx_rtsp_port=int(entry.data[CONF_MEDIAMTX_RTSP_PORT]),
         frame_dir=entry.data[CONF_FRAME_DIR],
         cameras=cameras,
     )
