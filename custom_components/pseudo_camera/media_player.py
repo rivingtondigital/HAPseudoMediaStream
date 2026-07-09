@@ -20,8 +20,9 @@ from .const import (
     ATTR_SOURCE_ENTITY,
     DOMAIN,
 )
-from .stream_utils import ha_stream_needs_auth
+from .device import camera_device_info
 from .relay_manager import RelayManager
+from .stream_utils import ha_stream_needs_auth
 from .types import CameraConfig, IntegrationRuntimeData, PathStatus
 
 _LOGGER = logging.getLogger(__name__)
